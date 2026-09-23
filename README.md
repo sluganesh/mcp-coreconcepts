@@ -16,6 +16,8 @@ A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server w
 
 ## How it works
 
+For the full design, including request flow, error handling, timeouts and trade-offs, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ```mermaid
 flowchart LR
     Client["MCP client<br/>(Claude, MCP Inspector, test_client.py)"]
@@ -133,6 +135,7 @@ The database uses port **5433** so it doesn't clash with a Postgres server that 
 server.py            MCP server: tools, logging decorator, database access
 test_client.py       End-to-end test that talks to the server over stdio
 db/init.sql          Employees table and sample data
+docs/ARCHITECTURE.md Design, request flow, error handling, timeouts
 docker-compose.yml   PostgreSQL 16 container with health check
 requirements.txt     Python dependencies
 ```

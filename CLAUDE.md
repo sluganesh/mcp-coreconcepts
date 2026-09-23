@@ -22,6 +22,8 @@ There is no pytest suite, linter, or build step. `test_client.py` is the only te
 
 ## Architecture and gotchas
 
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the full design, with diagrams. When you add or change a tool, keep it in sync with README.md.
+
 - **The SDK is `mcp` 2.x.** `FastMCP` was renamed `MCPServer` (`from mcp.server.mcpserver import MCPServer`), and `ToolError` lives in `mcp.server.mcpserver.exceptions`. Most online examples use the 1.x names and won't import.
 - **Never write to stdout from the server.** The stdio transport uses stdout for protocol messages. Logging goes to `mcp_calls.log` and to stderr.
 - **Defining a tool:** stack `@mcp.tool()` on the outside and `@log_call` on the inside. `log_call` uses `functools.wraps`, which keeps the original signature visible, and the SDK builds the tool's input schema and argument validation from that signature and its type hints. Each tool's docstring becomes its description.
