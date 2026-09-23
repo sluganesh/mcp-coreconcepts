@@ -1,10 +1,11 @@
-"""Start server.py over stdio and call add_integer once."""
+"""Start server.py over stdio and exercise every tool, including failure cases."""
 
 import asyncio
 import sys
 
-from mcp import ClientSession, StdioServerParameters
+from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
+from mcp.shared.exceptions import MCPError
 
 
 async def main():
@@ -29,6 +30,33 @@ async def main():
                 else:
                     rows = result.structured_content["result"]
                     print(f"get_employees({args}) -> OK: {len(rows)} row(s), first: {rows[0]}")
+
+            await test_long_running_task(session)
+
+
+async def show_progress(progress, total, message):
+    print(f"    progress: {progress:g}/{total:g} - {message}")
+
+
+async def test_long_running_task(session):
+    # 1. Finishes within the server-side timeout.
+    # 2. Server-side timeout: the tool stops itself and returns an error result.
+    for args in ({"duration_seconds": 2, "timeout_seconds": 5}, {"duration_seconds": 8, "timeout_seconds": 3}):
+        print(f"long_running_task({args}):")
+        result = await session.call_tool("long_running_task", args, progress_callback=show_progress)
+        status = "ERROR" if result.is_error else "OK"
+        print(f"  -> {status}: {result.content[0].text}")
+
+    # 3. Client-side timeout: the client stops waiting before the task finishes.
+    args = {"duration_seconds": 10, "timeout_seconds": 30}
+    print(f"long_running_task({args}) with a 2s client timeout:")
+    try:
+        await session.call_tool("long_running_task", args, read_timeout_seconds=2)
+    except MCPError as exc:
+        if exc.code != types.REQUEST_TIMEOUT:
+            raise
+        # The SDK also sends a cancellation, so the server stops the task.
+        print(f"  -> CLIENT TIMEOUT: {exc}")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A learning project: a local MCP server in Python (`server.py`) that runs over the stdio transport and exposes a few tools (`add_integer`, `divide`, `get_employees`). `get_employees` reads from a Postgres database that runs in Docker.
+A learning project: a local MCP server in Python (`server.py`) that runs over the stdio transport and exposes a few tools (`add_integer`, `divide`, `get_employees`, `long_running_task`). `get_employees` reads from a Postgres database that runs in Docker.
 
 ## Commands
 
@@ -30,6 +30,7 @@ There is no pytest suite, linter, or build step. `test_client.py` is the only te
   - Any other exception is logged with a full stack trace.
   - Database errors are caught, logged in full, and re-raised as a short `ToolError`.
   - Calls with bad argument types are rejected by the SDK before the tool function runs, so they produce no `CALL` log line.
+- **Async tools:** `log_call` detects coroutine functions and wraps them with an async wrapper. It logs `asyncio.CancelledError` as `CANCELLED`, which is what happens when a client's `read_timeout_seconds` expires, because the SDK then sends the server a cancellation. It also leaves the SDK-injected `Context` argument out of the logged arguments. For a server-side time limit, use `asyncio.wait_for` and turn the resulting `TimeoutError` into a `ToolError` (see `long_running_task`).
 - **Database:**
   - The connection string comes from the `DATABASE_URL` environment variable. The default matches `docker-compose.yml`: `postgresql://mcp_user:mcp_password@localhost:5433/company`. Port 5433 is deliberate, because other local projects' Postgres containers already use 5432 and 55432.
   - The server uses `psycopg` 3 with `dict_row`.

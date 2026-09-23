@@ -1,6 +1,6 @@
 # MCP Learning Server
 
-A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server written in Python. It gives AI assistants such as Claude three tools: two arithmetic tools and an employee lookup backed by PostgreSQL. Every call is logged, and every failure returns a clear error message instead of crashing the server.
+A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server written in Python. It gives AI assistants such as Claude four tools: two arithmetic tools, an employee lookup backed by PostgreSQL, and a long-running job that demonstrates timeouts. Every call is logged, and every failure returns a clear error message instead of crashing the server.
 
 **Built with:** Python 3.12 · MCP Python SDK 2.x · PostgreSQL 16 · psycopg 3 · Docker Compose
 
@@ -8,6 +8,7 @@ A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server w
 
 - **MCP server development:** tools are defined with type hints, and the SDK generates each tool's input schema and argument validation from them.
 - **Error handling:** expected failures such as dividing by zero, an unknown employee id or an unreachable database return a short `ToolError` message to the client. The full technical detail goes only to the server log.
+- **Async and timeouts:** an async tool reports progress while it runs and enforces its own time limit. The client can also set a timeout, and the server logs the resulting cancellation.
 - **Logging:** a decorator records every tool call with its arguments, result and duration. Logs never go to stdout, because the stdio transport uses stdout for protocol messages.
 - **Database access:** parameterized SQL queries, connection timeouts, and results converted to JSON-friendly types.
 - **Reproducible setup:** Docker Compose starts Postgres with a health check and loads sample data automatically.
@@ -34,6 +35,14 @@ flowchart LR
 | `add_integer` | `a: int`, `b: int` | The sum | Arguments that aren't integers |
 | `divide` | `a: float`, `b: float` | `a / b` | Division by zero; arguments that aren't numbers |
 | `get_employees` | `employee_id: int` (optional) | All employees, or the one with that id | Unknown id; id less than 1; database unavailable |
+| `long_running_task` | `duration_seconds: float`, `timeout_seconds: float` (default 5) | A completion message, with a progress update every second | Task ran past its timeout; a value that isn't between 0 and 120 |
+
+### Timeouts
+
+`long_running_task` simulates a slow job and shows two ways a timeout can happen:
+
+- **Server-side timeout.** The tool wraps its work in `asyncio.wait_for`. When `timeout_seconds` runs out, the work is cancelled and the client gets a normal error result: `Task timed out after 3s (it needed 8s)`.
+- **Client-side timeout.** The caller passes `read_timeout_seconds` to `call_tool` and handles the `MCPError` raised when time runs out. The SDK also sends the server a cancellation message. The server stops the task and logs `CANCELLED long_running_task after 2.00 s`, so no work is left running in the background.
 
 ## Getting started
 
@@ -57,7 +66,7 @@ python test_client.py
 Expected output:
 
 ```text
-Tools: ['add_integer', 'divide', 'get_employees']
+Tools: ['add_integer', 'divide', 'get_employees', 'long_running_task']
 add_integer(7, 35) = 42
 divide({'a': 10, 'b': 4}) -> OK: 2.5
 divide({'a': 10, 'b': 0}) -> ERROR: Error executing tool divide: Cannot divide by zero: 'b' must be a non-zero number.
@@ -65,6 +74,16 @@ get_employees({}) -> OK: 10 row(s), first: {'id': 1, 'first_name': 'Aarav', ...}
 get_employees({'employee_id': 3}) -> OK: 1 row(s), first: {'id': 3, 'first_name': 'Rahul', ...}
 get_employees({'employee_id': 999}) -> ERROR: Error executing tool get_employees: No employee found with id 999.
 get_employees({'employee_id': 0}) -> ERROR: Error executing tool get_employees: 'employee_id' must be a positive integer.
+long_running_task({'duration_seconds': 2, 'timeout_seconds': 5}):
+    progress: 1/2 - 1s of 2s done
+    progress: 2/2 - 2s of 2s done
+  -> OK: Task finished in 2s.
+long_running_task({'duration_seconds': 8, 'timeout_seconds': 3}):
+    progress: 1/8 - 1s of 8s done
+    progress: 2/8 - 2s of 8s done
+  -> ERROR: Error executing tool long_running_task: Task timed out after 3s (it needed 8s). Try a larger timeout_seconds.
+long_running_task({'duration_seconds': 10, 'timeout_seconds': 30}) with a 2s client timeout:
+  -> CLIENT TIMEOUT: Request 'tools/call' timed out
 ```
 
 (The output above is shortened. The full run also prints a validation error for `divide(10, "abc")`.)
