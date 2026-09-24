@@ -1,6 +1,6 @@
 # MCP Learning Server
 
-A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server written in Python. It gives AI assistants such as Claude four tools: two arithmetic tools, an employee lookup backed by PostgreSQL, and a long-running job that demonstrates timeouts. Every call is logged, and every failure returns a clear error message instead of crashing the server.
+A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server written in Python. It gives AI assistants such as Claude seven tools: two arithmetic tools, tools to read, create, update and delete employees in PostgreSQL, and a long-running job that demonstrates timeouts. Every call is logged, and every failure returns a clear error message instead of crashing the server.
 
 **Built with:** Python 3.12 · MCP Python SDK 2.x · PostgreSQL 16 · psycopg 3 · Docker Compose
 
@@ -10,7 +10,9 @@ A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server w
 - **Error handling:** expected failures such as dividing by zero, an unknown employee id or an unreachable database return a short `ToolError` message to the client. The full technical detail goes only to the server log.
 - **Async and timeouts:** an async tool reports progress while it runs and enforces its own time limit. The client can also set a timeout, and the server logs the resulting cancellation.
 - **Logging:** a decorator records every tool call with its arguments, result and duration. Logs never go to stdout, because the stdio transport uses stdout for protocol messages.
-- **Database access:** parameterized SQL queries, connection timeouts, and results converted to JSON-friendly types.
+- **Typed results:** `get_employees` returns Pydantic models, so clients get a detailed output schema (field names, types and descriptions), and every row is checked before it's returned.
+- **Write tools with tool annotations:** create, update and delete tools run in database transactions and check their inputs (email format, salary above 0). Each tool is marked as read-only, destructive or idempotent, so clients can decide which calls need the user's approval.
+- **Database access:** parameterized SQL queries, transactions that roll back on failure, and connection timeouts.
 - **Reproducible setup:** Docker Compose starts Postgres with a health check and loads sample data automatically.
 - **End-to-end testing:** a test client starts the server as a real MCP client would and calls every tool, covering both success and failure cases.
 
@@ -27,7 +29,7 @@ flowchart LR
 
     Client <-- "JSON-RPC over stdio" --> Server
     Server -- "every call" --> Log
-    Server -- "get_employees" --> DB
+    Server -- "employee tools" --> DB
 ```
 
 ## Tools
@@ -36,8 +38,24 @@ flowchart LR
 |---|---|---|---|
 | `add_integer` | `a: int`, `b: int` | The sum | Arguments that aren't integers |
 | `divide` | `a: float`, `b: float` | `a / b` | Division by zero; arguments that aren't numbers |
-| `get_employees` | `employee_id: int` (optional) | All employees, or the one with that id | Unknown id; id less than 1; database unavailable |
+| `get_employees` | `employee_id: int` (optional) | `{"employees": [...], "count": n}`: all employees, or the one with that id | Unknown id; id less than 1; database unavailable |
+| `create_employee` | `first_name`, `last_name`, `email`, `department`, `job_title`, `salary`, `hire_date` (optional, defaults to today) | The new employee record | Duplicate email; invalid email; salary not above 0; empty or too-long text |
+| `update_employee_salary` | `employee_id: int`, `new_salary: float` | The updated employee record | Unknown id; salary not above 0 |
+| `delete_employee` | `employee_id: int` | The deleted employee record | Unknown id |
 | `long_running_task` | `duration_seconds: float`, `timeout_seconds: float` (default 5) | A completion message, with a progress update every second | Task ran past its timeout; a value that isn't between 0 and 120 |
+
+### Tool annotations
+
+Each tool tells clients how it behaves. Clients can use these hints, for example to run read-only tools without asking and to ask the user before running destructive ones.
+
+| Tool | Read-only | Destructive | Idempotent | Why |
+|---|---|---|---|---|
+| `add_integer`, `divide`, `get_employees`, `long_running_task` | ✅ | — | ✅ | They don't change anything |
+| `create_employee` | ❌ | ❌ | ❌ | Adds a row without changing existing data; calling it twice adds two rows |
+| `update_employee_salary` | ❌ | ✅ | ✅ | Overwrites the old salary; setting the same value twice gives the same result |
+| `delete_employee` | ❌ | ✅ | ✅ | Removes data; deleting the same id again changes nothing more |
+
+All tools set `open_world_hint` to false, because they only touch this server's own data. Annotations are hints: the server doesn't enforce them, and clients shouldn't treat them as a security boundary.
 
 ### Timeouts
 
@@ -68,7 +86,7 @@ python test_client.py
 Expected output:
 
 ```text
-Tools: ['add_integer', 'divide', 'get_employees', 'long_running_task']
+Tools: ['add_integer', 'divide', 'get_employees', 'create_employee', 'update_employee_salary', 'delete_employee', 'long_running_task']
 add_integer(7, 35) = 42
 divide({'a': 10, 'b': 4}) -> OK: 2.5
 divide({'a': 10, 'b': 0}) -> ERROR: Error executing tool divide: Cannot divide by zero: 'b' must be a non-zero number.
@@ -76,6 +94,12 @@ get_employees({}) -> OK: 10 row(s), first: {'id': 1, 'first_name': 'Aarav', ...}
 get_employees({'employee_id': 3}) -> OK: 1 row(s), first: {'id': 3, 'first_name': 'Rahul', ...}
 get_employees({'employee_id': 999}) -> ERROR: Error executing tool get_employees: No employee found with id 999.
 get_employees({'employee_id': 0}) -> ERROR: Error executing tool get_employees: 'employee_id' must be a positive integer.
+create_employee({... 'email': 'test.554db078@example.com', 'salary': 50000}) -> OK: {'id': 13, ..., 'hire_date': '2026-09-24'}
+create_employee({'first_name': 'Dup', ...}) -> ERROR: Error executing tool create_employee: An employee with email test.554db078@example.com already exists.
+update_employee_salary({'employee_id': 13, 'new_salary': 55000}) -> OK: {'id': 13, ..., 'salary': 55000.0, ...}
+update_employee_salary({'employee_id': 999, 'new_salary': 55000}) -> ERROR: Error executing tool update_employee_salary: No employee found with id 999.
+delete_employee({'employee_id': 13}) -> OK: {'id': 13, 'first_name': 'Test', ...}
+delete_employee({'employee_id': 13}) -> ERROR: Error executing tool delete_employee: No employee found with id 13.
 long_running_task({'duration_seconds': 2, 'timeout_seconds': 5}):
     progress: 1/2 - 1s of 2s done
     progress: 2/2 - 2s of 2s done
@@ -88,7 +112,7 @@ long_running_task({'duration_seconds': 10, 'timeout_seconds': 30}) with a 2s cli
   -> CLIENT TIMEOUT: Request 'tools/call' timed out
 ```
 
-(The output above is shortened. The full run also prints a validation error for `divide(10, "abc")`.)
+(The output above is shortened. The full run also prints the tool annotations and the validation errors for `divide(10, "abc")`, an invalid email and a negative salary. The test creates its own employee with a random email and deletes it at the end, so it can be run repeatedly.)
 
 ## Other ways to try it
 
@@ -143,7 +167,7 @@ requirements.txt     Python dependencies
 ## Adding a tool
 
 ```python
-@mcp.tool()      # registers the tool; the schema comes from the type hints
+@mcp.tool(annotations=READ_ONLY)   # registers the tool; the schema comes from the type hints
 @log_call        # logs arguments, result, duration and errors
 def multiply(a: float, b: float) -> float:
     """Multiply two numbers."""   # shown to the AI as the tool's description

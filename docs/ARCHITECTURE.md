@@ -8,11 +8,12 @@ This document explains how the MCP Learning Server is put together: its componen
 2. [Components](#components)
 3. [Life of a tool call](#life-of-a-tool-call)
 4. [Error handling](#error-handling)
-5. [Timeouts and cancellation](#timeouts-and-cancellation)
-6. [Logging](#logging)
-7. [Data layer](#data-layer)
-8. [Design decisions](#design-decisions)
-9. [Known limitations](#known-limitations)
+5. [Tool annotations](#tool-annotations)
+6. [Timeouts and cancellation](#timeouts-and-cancellation)
+7. [Logging](#logging)
+8. [Data layer](#data-layer)
+9. [Design decisions](#design-decisions)
+10. [Known limitations](#known-limitations)
 
 ## Overview
 
@@ -29,10 +30,13 @@ flowchart LR
         LC["log_call decorator"]
         T1["add_integer"]
         T2["divide"]
-        T3["get_employees"]
+        T3["get_employees<br/>(read)"]
+        T5["create / update / delete<br/>employee (write)"]
         T4["long_running_task"]
+        H["employees_db()<br/>transaction + error translation"]
         SDK --> LC
-        LC --> T1 & T2 & T3 & T4
+        LC --> T1 & T2 & T3 & T5 & T4
+        T3 & T5 --> H
     end
 
     subgraph Docker
@@ -43,7 +47,7 @@ flowchart LR
 
     C <-- "JSON-RPC over stdio" --> SDK
     LC -- "every call" --> LOG
-    T3 -- "psycopg 3 / SQL" --> DB
+    H -- "psycopg 3 / SQL" --> DB
 ```
 
 ## Components
@@ -52,7 +56,8 @@ flowchart LR
 |---|---|---|
 | MCP server | `server.py` | Registers the tools, runs the stdio transport, and holds all tool logic |
 | `log_call` decorator | `server.py` | Logs each call's arguments, result, duration and outcome, for both sync and async tools |
-| Tools | `server.py` | `add_integer`, `divide`, `get_employees` and `long_running_task` |
+| Tools | `server.py` | `add_integer`, `divide`, `get_employees`, `create_employee`, `update_employee_salary`, `delete_employee` and `long_running_task` |
+| `employees_db()` | `server.py` | Opens a database transaction for the employee tools and turns database errors into `ToolError`s |
 | Database | `docker-compose.yml`, `db/init.sql` | PostgreSQL 16 with an `employees` table and 10 sample rows |
 | Test client | `test_client.py` | Starts the server over stdio and calls every tool, covering success, failure and timeout cases |
 
@@ -80,9 +85,10 @@ sequenceDiagram
         S->>L: call wrapped tool
         L->>L: log CALL name + arguments
         L->>T: invoke
-        opt get_employees
-            T->>DB: parameterized SELECT
+        opt employee tools
+            T->>DB: BEGIN; parameterized SELECT / INSERT / UPDATE / DELETE … RETURNING
             DB-->>T: rows
+            T->>DB: COMMIT (or ROLLBACK if anything raised)
         end
         alt success
             T-->>L: return value
@@ -99,9 +105,12 @@ sequenceDiagram
 ```
 
 Notes:
-- **Registration.** Each tool is registered as `@mcp.tool()` stacked on `@log_call`. `log_call` uses `functools.wraps`, which keeps the original function's signature visible, so the SDK still builds the correct schema from it.
-- **Sync vs async tools.** The SDK runs synchronous tools (`add_integer`, `divide`, `get_employees`) on a worker thread through `anyio.to_thread.run_sync`, so a blocking database call doesn't stall the event loop. Async tools (`long_running_task`) run directly on the event loop.
-- **Return values.** A tool that returns something other than an object, such as `get_employees` returning a list, has its value wrapped by the SDK as `{"result": ...}` in `structured_content`.
+- **Registration.** Each tool is registered as `@mcp.tool(annotations=...)` stacked on `@log_call`. `log_call` uses `functools.wraps`, which keeps the original function's signature visible, so the SDK still builds the correct schema from it.
+- **Input constraints.** Rules such as `salary > 0`, an email pattern and text length limits are written into the signature as `Annotated[type, Field(...)]`. They appear in the input schema (for example `"exclusiveMinimum": 0`, `"pattern": ...`), so clients know them in advance, and the SDK rejects bad input before the tool runs.
+- **Sync vs async tools.** The SDK runs synchronous tools (the math and employee tools) on a worker thread through `anyio.to_thread.run_sync`, so a blocking database call doesn't stall the event loop. Async tools (`long_running_task`) run directly on the event loop.
+- **Return values.** The SDK builds each tool's output schema from its return type.
+  - `get_employees` returns a Pydantic model, `EmployeeList` (`{"employees": [...], "count": n}`). The write tools return a single `Employee`: the record as it is after the change, or, for `delete_employee`, the record that was removed. The schema therefore lists every field with its type and description, for example `salary` as a number described as "Annual salary in USD" and `hire_date` as a string with `"format": "date"`.
+  - Simple return types such as `int` or `str` are wrapped by the SDK as `{"result": ...}` in `structured_content`.
 
 ## Error handling
 
@@ -109,11 +118,32 @@ Errors fall into three categories, and each one is handled differently:
 
 | Category | Example | Where it's caught | What the client sees | What gets logged |
 |---|---|---|---|---|
-| **Invalid input** (wrong type) | `divide(10, "abc")` | The SDK, before the tool runs | `is_error` result with the validation message | An SDK log line; no `CALL` line |
-| **Expected failure** (`ToolError`) | Dividing by zero, unknown employee id, database down, timeout | Raised by the tool | `is_error` result with a short, readable message | `WARNING FAILED …`, no stack trace |
+| **Invalid input** (wrong type or broken constraint) | `divide(10, "abc")`, `create_employee` with a negative salary | The SDK, before the tool runs | `is_error` result with the validation message | An SDK log line; no `CALL` line |
+| **Expected failure** (`ToolError`) | Dividing by zero, unknown employee id, duplicate email, database down, timeout | Raised by the tool | `is_error` result with a short, readable message | `WARNING FAILED …`, no stack trace |
 | **Unexpected failure** (any other exception) | A bug | `log_call` | `is_error` result | `ERROR` with a full stack trace |
 
-Database errors are translated at the tool boundary. The tool catches `psycopg.OperationalError` (the database can't be reached) and `psycopg.Error` (the query failed), writes the full detail to the log, and raises a short `ToolError`. This keeps connection strings and driver internals out of the client's view.
+Database errors are translated in one place, the `employees_db()` context manager. It catches `psycopg.OperationalError` (the database can't be reached) and `psycopg.Error` (the query failed), writes the full detail to the log, and raises a short `ToolError`. This keeps connection strings and driver internals out of the client's view.
+
+When a tool needs a more specific message, it catches that `ToolError` and checks the original database error in `exc.__cause__`. For example, `create_employee` turns a `UniqueViolation` on the email column into "An employee with email … already exists."
+
+## Tool annotations
+
+Every tool declares how it behaves, using the MCP tool annotations:
+
+| Tool | `read_only_hint` | `destructive_hint` | `idempotent_hint` | `open_world_hint` |
+|---|---|---|---|---|
+| `add_integer`, `divide`, `get_employees`, `long_running_task` | true | — | true | false |
+| `create_employee` | false | false | false | false |
+| `update_employee_salary` | false | true | true | false |
+| `delete_employee` | false | true | true | false |
+
+How the values were chosen:
+- **Destructive** means the tool can overwrite or remove existing data, as opposed to only adding new data. Creating is additive. Updating a salary overwrites the old value, so it counts as destructive even though it isn't a delete.
+- **Idempotent** means repeating the same call with the same arguments has no further effect. Setting a salary to 55,000 twice leaves 55,000. Deleting id 13 twice leaves id 13 deleted; the second call just reports "not found". Creating twice would add two employees, so `create_employee` is not idempotent.
+- **Open world** is false for every tool, because they only touch this server's own database, not outside systems such as the web or third-party APIs.
+- `destructive_hint` and `idempotent_hint` only matter when `read_only_hint` is false, so the read-only tools leave `destructive_hint` unset.
+
+Clients use these hints to decide how to treat each call, for example running read-only tools without asking and asking the user before destructive ones. They are only hints: the server doesn't enforce them, and they are no substitute for real authorization.
 
 ## Timeouts and cancellation
 
@@ -154,8 +184,11 @@ sequenceDiagram
 ## Data layer
 
 - **Schema.** One table, `employees`, with columns `id`, `first_name`, `last_name`, `email`, `department`, `job_title`, `salary` and `hire_date`. It's created and filled with sample data by `db/init.sql`, which Postgres runs only when the `pgdata` volume is first created.
-- **Connection.** The server reads `DATABASE_URL`, which defaults to `postgresql://mcp_user:mcp_password@localhost:5433/company`. It opens a new connection per call with a 5-second connect timeout and uses `dict_row`, so each row comes back as a dictionary.
-- **Queries.** Values are always passed as `%s` parameters, never formatted into the SQL string. `NUMERIC` and `DATE` columns are cast to `float` and `text` in SQL, so the rows can be serialized to JSON without extra conversion code.
+- **Connection.** The server reads `DATABASE_URL`, which defaults to `postgresql://mcp_user:mcp_password@localhost:5433/company`. It opens a new connection per call with a 5-second connect timeout.
+- **Rows as models.** The query uses `class_row(Employee)`, so each row is built as a Pydantic `Employee` and validated. Pydantic converts `NUMERIC` (`Decimal`) to `float`, and `DATE` to an ISO string in the JSON result. If a row doesn't match the model, the call fails with a logged error instead of returning wrong data.
+- **Queries.** Values are always passed as `%s` parameters, never formatted into the SQL string. The column list (`EMPLOYEE_COLUMNS`) is taken from the model's fields and used in both `SELECT` and `RETURNING`, so the queries and the model can't drift apart.
+- **Transactions.** Every tool call runs in one transaction through `employees_db()`. psycopg commits when the block finishes normally and rolls back if anything raises, including a `ToolError`. Write tools use `RETURNING`, so each change and the record it returns come from a single statement.
+- **Id gaps are expected.** A failed insert, such as one with a duplicate email, still uses up the next value of the `id` sequence, because Postgres sequences are never rolled back. Ids are therefore unique but not guaranteed to be consecutive.
 - **Port.** The database uses host port 5433 so that it can run alongside another Postgres server on the default port, 5432.
 
 ## Design decisions
@@ -166,7 +199,7 @@ sequenceDiagram
 | Type hints as the contract | One source of truth: the SDK builds both the schema the AI sees and the input validation from the function signature. |
 | `ToolError` for expected failures | The caller gets a clear, useful message, and the server keeps running. |
 | A logging decorator instead of logging in each tool | Every tool is logged the same way, and adding a tool doesn't need any logging code. |
-| Casting column types in SQL | Keeps the Python code free of conversion logic for `Decimal` and `date` values. |
+| Pydantic models as tool results | Clients get a detailed output schema, rows are validated, and type conversion (`Decimal`, `date`) is handled in one place. |
 | Postgres in Docker Compose | One command starts the database and loads sample data, the same way on any machine. |
 
 ## Known limitations
@@ -176,5 +209,6 @@ These are deliberate simplifications for a learning project, with what a product
 - **A new database connection per call.** A connection pool (`psycopg_pool`) would avoid the setup cost of each call.
 - **Database queries can't be interrupted.** `get_employees` runs on a worker thread, so a client cancellation doesn't stop a query that's already running. An async tool with `psycopg.AsyncConnection` and a Postgres `statement_timeout` would make queries cancellable and time-limited.
 - **No automated test suite.** `test_client.py` is an end-to-end script that prints results rather than asserting them. The next step would be pytest tests that check `is_error` and returned values.
+- **Destructive tools don't ask for confirmation.** `update_employee_salary` and `delete_employee` rely on the client respecting their annotations. Using elicitation, the server could ask the user to confirm before it changes anything.
 - **No authentication.** That's appropriate for stdio, where only the parent process can talk to the server. The streamable HTTP transport would need an auth layer.
 - **Development credentials in `docker-compose.yml`.** Fine for a local sample database. A real deployment would load them from secrets.

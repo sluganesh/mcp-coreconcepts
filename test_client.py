@@ -2,6 +2,7 @@
 
 import asyncio
 import sys
+import uuid
 
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
@@ -28,10 +29,46 @@ async def main():
                 if result.is_error:
                     print(f"get_employees({args}) -> ERROR: {result.content[0].text}")
                 else:
-                    rows = result.structured_content["result"]
-                    print(f"get_employees({args}) -> OK: {len(rows)} row(s), first: {rows[0]}")
+                    data = result.structured_content
+                    print(f"get_employees({args}) -> OK: {data['count']} row(s), first: {data['employees'][0]}")
 
+            await test_write_tools(session)
             await test_long_running_task(session)
+
+
+def show(name, args, result):
+    if result.is_error:
+        print(f"{name}({args}) -> ERROR: {result.content[0].text}")
+    else:
+        print(f"{name}({args}) -> OK: {result.structured_content}")
+    return result
+
+
+async def test_write_tools(session):
+    print("Annotations (read_only / destructive / idempotent / open_world):")
+    for tool in (await session.list_tools()).tools:
+        a = tool.annotations
+        print(f"  {tool.name:24} {a.read_only_hint} / {a.destructive_hint} / {a.idempotent_hint} / {a.open_world_hint}")
+
+    # A unique email per run, so the test can be repeated.
+    email = f"test.{uuid.uuid4().hex[:8]}@example.com"
+    new = {
+        "first_name": "Test", "last_name": "User", "email": email,
+        "department": "QA", "job_title": "Tester", "salary": 50000,
+    }
+    result = show("create_employee", new, await session.call_tool("create_employee", new))
+    new_id = result.structured_content["id"]
+
+    for name, args in (
+        ("create_employee", {**new, "first_name": "Dup"}),              # duplicate email
+        ("create_employee", {**new, "email": "not-an-email"}),          # bad email format
+        ("create_employee", {**new, "email": "x@example.com", "salary": -5}),  # salary must be > 0
+        ("update_employee_salary", {"employee_id": new_id, "new_salary": 55000}),
+        ("update_employee_salary", {"employee_id": 999, "new_salary": 55000}),
+        ("delete_employee", {"employee_id": new_id}),
+        ("delete_employee", {"employee_id": new_id}),                   # already deleted
+    ):
+        show(name, args, await session.call_tool(name, args))
 
 
 async def show_progress(progress, total, message):
