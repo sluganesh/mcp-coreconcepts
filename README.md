@@ -14,6 +14,7 @@ A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server w
 - **Write tools with tool annotations:** create, update and delete tools run in database transactions and check their inputs (email format, salary above 0). Each tool is marked as read-only, destructive or idempotent, so clients can decide which calls need the user's approval.
 - **Resources and resource templates:** read-only data a client can load into the AI's context: an HR handbook, `employees://{employee_id}` profiles and `departments://{department}/employees` rosters.
 - **Prompts and autocomplete:** reusable HR templates (a department headcount report, a new-hire welcome email) that attach live data to the message, with autocomplete for department names and employee ids.
+- **Pagination:** `get_employees` returns results a page at a time with an opaque cursor, the MCP convention, using keyset pagination in SQL.
 - **Logging to the client:** `bulk_import_employees` sends debug, info and warning messages to the client as it imports a CSV, and also returns a complete summary. MCP logging is deprecated in the 2026-07-28 spec, so the summary is the part that keeps working.
 - **Elicitation (asking the user partway through a call):** `delete_employee` pauses to ask the user to confirm, and deletes only on an explicit "yes". It refuses to run on clients that can't show the prompt.
 - **Database access:** parameterized SQL queries, transactions that roll back on failure, and connection timeouts.
@@ -42,7 +43,7 @@ flowchart LR
 |---|---|---|---|
 | `add_integer` | `a: int`, `b: int` | The sum | Arguments that aren't integers |
 | `divide` | `a: float`, `b: float` | `a / b` | Division by zero; arguments that aren't numbers |
-| `get_employees` | `employee_id: int` (optional) | `{"employees": [...], "count": n}`: all employees, or the one with that id | Unknown id; id less than 1; database unavailable |
+| `get_employees` | `employee_id: int`, `page_size: int` (1–100, default 50), `cursor: str` (all optional) | `{"employees": [...], "count", "total", "next_cursor"}`: one page of employees, or the one with that id | Unknown id; id less than 1; invalid cursor; page size out of range; database unavailable |
 | `create_employee` | `first_name`, `last_name`, `email`, `department`, `job_title`, `salary`, `hire_date` (optional, defaults to today) | The new employee record | Duplicate email; invalid email; salary not above 0; empty or too-long text |
 | `update_employee_salary` | `employee_id: int`, `new_salary: float` | The updated employee record | Unknown id; salary not above 0 |
 | `delete_employee` | `employee_id: int` | The deleted employee record, after the user confirms | Unknown id; the user declined, cancelled or didn't confirm; client can't show a confirmation prompt |
@@ -70,6 +71,20 @@ Annotations let a client ask before running a tool, but nothing forces it to. Fo
 2. The client shows the prompt, and the user replies in one of three ways: **accept** (with the box checked or not), **decline** or **cancel**.
 3. Only **accept** with `confirm` checked deletes the record. Every other answer returns an error saying nothing was deleted.
 4. If the client doesn't support elicitation, the tool refuses rather than deleting without asking.
+
+### Pagination
+
+`get_employees` returns employees one page at a time, so a large company doesn't arrive as one huge response:
+
+```text
+get_employees(page_size=4)                  -> ids [1, 2, 3, 4]  total 10  next_cursor="eyJhZnRlcl9pZCI6IDR9"
+get_employees(page_size=4, cursor="eyJh…")  -> ids [5, 6, 7, 8]  total 10  next_cursor="eyJhZnRlcl9pZCI6IDh9"
+get_employees(page_size=4, cursor="eyJh…")  -> ids [9, 10]       total 10  next_cursor=null
+```
+
+- **Opaque cursor.** This follows the MCP convention: the client passes `next_cursor` back unchanged and never builds or reads one itself. A value that isn't a real cursor is rejected. Internally it encodes the last id seen, so the format can change without breaking clients.
+- **Keyset pagination.** Each page is fetched with `WHERE id > last_id ORDER BY id LIMIT n`, not `OFFSET`. That stays fast on large tables, and adding or deleting employees between pages doesn't cause rows to be skipped or shown twice.
+- **Limits.** `page_size` defaults to 50 and can be at most 100. The response includes `total`, so a client can show "page 1 of 3".
 
 ### Bulk import and logging to the client
 
@@ -181,6 +196,10 @@ get_employees({}) -> OK: 10 row(s), first: {'id': 1, 'first_name': 'Aarav', ...}
 get_employees({'employee_id': 3}) -> OK: 1 row(s), first: {'id': 3, 'first_name': 'Rahul', ...}
 get_employees({'employee_id': 999}) -> ERROR: Error executing tool get_employees: No employee found with id 999.
 get_employees({'employee_id': 0}) -> ERROR: Error executing tool get_employees: 'employee_id' must be a positive integer.
+get_employees page 1: ids [1, 2, 3, 4] (count 4, total 10), next_cursor=eyJhZnRlcl9pZCI6IDR9
+get_employees page 2: ids [5, 6, 7, 8] (count 4, total 10), next_cursor=eyJhZnRlcl9pZCI6IDh9
+get_employees page 3: ids [9, 10] (count 2, total 10), next_cursor=None
+get_employees({'cursor': 'not-a-real-cursor'}) -> ERROR: Error executing tool get_employees: Invalid cursor. Pass the next_cursor value from a previous page unchanged.
 create_employee({... 'email': 'test.cd83c531@example.com', 'salary': 50000}) -> OK: {'id': 17, ..., 'hire_date': '2026-09-24'}
 create_employee({'first_name': 'Dup', ...}) -> ERROR: Error executing tool create_employee: An employee with email test.cd83c531@example.com already exists.
 update_employee_salary({'employee_id': 17, 'new_salary': 55000}) -> OK: {'id': 17, ..., 'salary': 55000.0, ...}

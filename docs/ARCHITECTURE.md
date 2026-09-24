@@ -12,12 +12,13 @@ This document explains how the MCP Learning Server is put together: its componen
 6. [Elicitation: confirming deletes](#elicitation-confirming-deletes)
 7. [Resources](#resources)
 8. [Prompts and completions](#prompts-and-completions)
-9. [Bulk import and logging to the client](#bulk-import-and-logging-to-the-client)
-10. [Timeouts and cancellation](#timeouts-and-cancellation)
-11. [Logging](#logging)
-12. [Data layer](#data-layer)
-13. [Design decisions](#design-decisions)
-14. [Known limitations](#known-limitations)
+9. [Pagination](#pagination)
+10. [Bulk import and logging to the client](#bulk-import-and-logging-to-the-client)
+11. [Timeouts and cancellation](#timeouts-and-cancellation)
+12. [Logging](#logging)
+13. [Data layer](#data-layer)
+14. [Design decisions](#design-decisions)
+15. [Known limitations](#known-limitations)
 
 ## Overview
 
@@ -281,6 +282,36 @@ sequenceDiagram
 
 Tool errors are results rather than protocol errors so that the AI can see what went wrong and try again. Resources and prompts are driven by the user or the app, so their failures are reported to the client as ordinary request errors.
 
+## Pagination
+
+`get_employees` pages through results using MCP's cursor convention: every response carries a `next_cursor`, and the client sends it back to get the next page, until it's `null`.
+
+```mermaid
+sequenceDiagram
+    participant C as MCP client
+    participant S as get_employees
+    participant DB as PostgreSQL
+
+    C->>S: {page_size: 4}
+    S->>DB: SELECT … WHERE id > 0 ORDER BY id LIMIT 5
+    DB-->>S: ids 1–5 (5 rows, so there's more)
+    S-->>C: ids 1–4, total 10, next_cursor = encode(after_id 4)
+    C->>S: {page_size: 4, cursor}
+    S->>DB: SELECT … WHERE id > 4 ORDER BY id LIMIT 5
+    DB-->>S: ids 5–9
+    S-->>C: ids 5–8, next_cursor = encode(after_id 8)
+    C->>S: {page_size: 4, cursor}
+    S->>DB: SELECT … WHERE id > 8 ORDER BY id LIMIT 5
+    DB-->>S: ids 9–10 (2 rows, no more)
+    S-->>C: ids 9–10, next_cursor = null
+```
+
+- **Keyset, not OFFSET.** `WHERE id > last_id ORDER BY id` uses the primary-key index, so later pages cost the same as the first one. OFFSET has to scan past every skipped row, and it shifts results when rows are added or deleted between requests. For example, deleting an employee on page 1 would make OFFSET skip one employee on page 2. Keyset paging avoids both problems.
+- **One extra row.** The query asks for `page_size + 1` rows. If the extra row comes back, there's another page. That avoids a separate "is there more?" query.
+- **Opaque cursors.** The cursor is URL-safe base64 of `{"after_id": n}`. Clients must treat it as an opaque token. The server validates it on the way in and rejects anything malformed with a `ToolError`, so the encoding can change later without breaking clients.
+- **Bounds.** `page_size` is limited to 1–100 in the input schema, so the SDK rejects anything outside that range before the tool runs. `total` comes from a separate `count(*)`, which is fine at this scale. For very large tables, an estimate or leaving the total out would be cheaper.
+- **Protocol-level lists.** MCP's own list requests (`tools/list`, `resources/list`, `prompts/list`) use the same cursor convention. This SDK's high-level `MCPServer` returns every item in a single page, which suits a server with a handful of tools and resources. A server with thousands of resources would need the low-level server API to page those lists too.
+
 ## Bulk import and logging to the client
 
 `bulk_import_employees(csv_text)` imports many employees at once and reports what it's doing while it runs.
@@ -373,6 +404,7 @@ sequenceDiagram
 | Type hints as the contract | One source of truth: the SDK builds both the schema the AI sees and the input validation from the function signature. |
 | Server-side confirmation (elicitation) for deletes, refusing if the client can't prompt | Annotations are only hints. For an action that can't be undone, the server enforces the "ask first" rule itself and fails safe. |
 | Resources for read-only reference data, next to the read tools | The client or user can attach data (a policy document, a profile) to the conversation directly, without the AI having to decide to call a tool |
+| Keyset pagination with opaque cursors | Constant cost per page and stable results while data changes, and the cursor format can change without breaking clients |
 | `ToolError` for expected failures | The caller gets a clear, useful message, and the server keeps running. |
 | A logging decorator instead of logging in each tool | Every tool is logged the same way, and adding a tool doesn't need any logging code. |
 | Pydantic models as tool results | Clients get a detailed output schema, rows are validated, and type conversion (`Decimal`, `date`) is handled in one place. |

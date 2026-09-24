@@ -50,6 +50,7 @@ async def main():
                     data = result.structured_content
                     print(f"get_employees({args}) -> OK: {data['count']} row(s), first: {data['employees'][0]}")
 
+            await test_pagination(session)
             await test_write_tools(session)
             await test_resources(session)
             await test_prompts(session)
@@ -63,6 +64,24 @@ def show(name, args, result):
     else:
         print(f"{name}({args}) -> OK: {result.structured_content}")
     return result
+
+
+async def test_pagination(session):
+    # Follow next_cursor until it's null, the way any MCP client pages through results.
+    args = {"page_size": 4}
+    page = 1
+    while True:
+        data = (await session.call_tool("get_employees", args)).structured_content
+        ids = [e["id"] for e in data["employees"]]
+        print(f"get_employees page {page}: ids {ids} (count {data['count']}, total {data['total']}), "
+              f"next_cursor={data['next_cursor']}")
+        if data["next_cursor"] is None:
+            break
+        args = {"page_size": 4, "cursor": data["next_cursor"]}
+        page += 1
+
+    for args in ({"cursor": "not-a-real-cursor"}, {"page_size": 0}, {"page_size": 500}):
+        show("get_employees", args, await session.call_tool("get_employees", args))
 
 
 async def test_write_tools(session):

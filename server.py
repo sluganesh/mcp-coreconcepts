@@ -8,10 +8,12 @@ stdout, because the stdio transport uses stdout for MCP protocol messages.
 """
 
 import asyncio
+import base64
 import csv
 import functools
 import io
 import inspect
+import json
 import logging
 import os
 import sys
@@ -65,10 +67,15 @@ class Employee(BaseModel):
 
 
 class EmployeeList(BaseModel):
-    """Result of get_employees."""
+    """A page of employees."""
 
     employees: list[Employee]
-    count: int = Field(description="Number of employees returned.")
+    count: int = Field(description="Number of employees in this page.")
+    total: int | None = Field(default=None, description="Number of employees in all pages.")
+    next_cursor: str | None = Field(
+        default=None,
+        description="Pass this as 'cursor' to get the next page. Null when this is the last page.",
+    )
 
 
 # Tool annotations are hints for clients, e.g. to auto-approve read-only tools
@@ -203,6 +210,9 @@ def employees_db():
         raise ToolError("The database operation failed. Check the server log for details.") from exc
 
 
+DEFAULT_PAGE_SIZE = 50
+MAX_PAGE_SIZE = 100
+
 EmployeeId = Annotated[int, Field(ge=1, description="Id of the employee.")]
 Salary = Annotated[float, Field(gt=0, lt=100_000_000, description="Annual salary in USD.")]
 Name = Annotated[str, Field(min_length=1, max_length=50)]
@@ -210,24 +220,52 @@ Name = Annotated[str, Field(min_length=1, max_length=50)]
 
 @mcp.tool(annotations=READ_ONLY)
 @log_call
-def get_employees(employee_id: int | None = None) -> EmployeeList:
-    """List all employees, or only the employee with the given id."""
-    if employee_id is not None and employee_id < 1:
-        raise ToolError("'employee_id' must be a positive integer.")
+def get_employees(
+    employee_id: int | None = None,
+    page_size: Annotated[int, Field(ge=1, le=MAX_PAGE_SIZE, description="Employees per page.")] = DEFAULT_PAGE_SIZE,
+    cursor: Annotated[
+        str | None, Field(description="The next_cursor from a previous page. Omit for the first page.")
+    ] = None,
+) -> EmployeeList:
+    """List employees one page at a time, ordered by id, or get one employee by id.
 
-    query = f"SELECT {EMPLOYEE_COLUMNS} FROM employees"
-    params: tuple = ()
+    If next_cursor in the result isn't null, call again with cursor=next_cursor for more.
+    """
     if employee_id is not None:
-        query += " WHERE id = %s"
-        params = (employee_id,)
-    query += " ORDER BY id"
+        if employee_id < 1:
+            raise ToolError("'employee_id' must be a positive integer.")
+        return EmployeeList(employees=[find_employee(employee_id)], count=1, total=1)
 
+    after_id = decode_cursor(cursor) if cursor else 0
     with employees_db() as conn:
-        rows = conn.execute(query, params).fetchall()
+        # Keyset pagination: continue after the last id seen, rather than
+        # skipping rows with OFFSET. Fetch one extra row to learn if there's more.
+        rows = conn.execute(
+            f"SELECT {EMPLOYEE_COLUMNS} FROM employees WHERE id > %s ORDER BY id LIMIT %s",
+            (after_id, page_size + 1),
+        ).fetchall()
+        total = conn.cursor(row_factory=dict_row).execute("SELECT count(*) AS n FROM employees").fetchone()["n"]
 
-    if employee_id is not None and not rows:
-        raise ToolError(f"No employee found with id {employee_id}.")
-    return EmployeeList(employees=rows, count=len(rows))
+    has_more = len(rows) > page_size
+    page = rows[:page_size]
+    next_cursor = encode_cursor(page[-1].id) if has_more else None
+    return EmployeeList(employees=page, count=len(page), total=total, next_cursor=next_cursor)
+
+
+# Cursors are opaque to clients: they pass next_cursor back unchanged and must
+# not build or parse one. Encoding the position means the format can change later.
+def encode_cursor(after_id: int) -> str:
+    return base64.urlsafe_b64encode(json.dumps({"after_id": after_id}).encode()).decode()
+
+
+def decode_cursor(cursor: str) -> int:
+    try:
+        after_id = json.loads(base64.urlsafe_b64decode(cursor.encode()))["after_id"]
+    except (ValueError, KeyError, TypeError):
+        raise ToolError("Invalid cursor. Pass the next_cursor value from a previous page unchanged.") from None
+    if not isinstance(after_id, int) or after_id < 0:
+        raise ToolError("Invalid cursor. Pass the next_cursor value from a previous page unchanged.")
+    return after_id
 
 
 # Adds a new row and changes nothing that already exists, so it isn't
