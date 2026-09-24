@@ -10,11 +10,12 @@ This document explains how the MCP Learning Server is put together: its componen
 4. [Error handling](#error-handling)
 5. [Tool annotations](#tool-annotations)
 6. [Elicitation: confirming deletes](#elicitation-confirming-deletes)
-7. [Timeouts and cancellation](#timeouts-and-cancellation)
-8. [Logging](#logging)
-9. [Data layer](#data-layer)
-10. [Design decisions](#design-decisions)
-11. [Known limitations](#known-limitations)
+7. [Resources](#resources)
+8. [Timeouts and cancellation](#timeouts-and-cancellation)
+9. [Logging](#logging)
+10. [Data layer](#data-layer)
+11. [Design decisions](#design-decisions)
+12. [Known limitations](#known-limitations)
 
 ## Overview
 
@@ -34,10 +35,11 @@ flowchart LR
         T3["get_employees<br/>(read)"]
         T5["create / update / delete<br/>employee (write)"]
         T4["long_running_task"]
+        R["Resources<br/>hr://handbook · employees://{id}<br/>departments://{dept}/employees"]
         H["employees_db()<br/>transaction + error translation"]
         SDK --> LC
-        LC --> T1 & T2 & T3 & T5 & T4
-        T3 & T5 --> H
+        LC --> T1 & T2 & T3 & T5 & T4 & R
+        T3 & T5 & R --> H
     end
 
     subgraph Docker
@@ -58,6 +60,7 @@ flowchart LR
 | MCP server | `server.py` | Registers the tools, runs the stdio transport, and holds all tool logic |
 | `log_call` decorator | `server.py` | Logs each call's arguments, result, duration and outcome, for both sync and async tools |
 | Tools | `server.py` | `add_integer`, `divide`, `get_employees`, `create_employee`, `update_employee_salary`, `delete_employee` and `long_running_task` |
+| Resources | `server.py`, `resources/hr_handbook.md` | `hr://handbook`, `employees://{employee_id}` and `departments://{department}/employees` |
 | `employees_db()` | `server.py` | Opens a database transaction for the employee tools and turns database errors into `ToolError`s |
 | Database | `docker-compose.yml`, `db/init.sql` | PostgreSQL 16 with an `employees` table and 10 sample rows |
 | Test client | `test_client.py` | Starts the server over stdio and calls every tool, covering success, failure and timeout cases |
@@ -183,6 +186,41 @@ sequenceDiagram
 - **Async tool, blocking database.** `delete_employee` is async so that it can `await ctx.elicit(...)`. Its database calls are blocking, so it runs them through `asyncio.to_thread` to keep the event loop free for other requests while it waits for the user.
 - **Audit log.** Every answer is logged, for example `ELICIT delete_employee id=17 -> accept confirm=True`.
 
+## Resources
+
+Resources are read-only data identified by a URI. They complement tools: the AI decides when to call a tool, while the user or client application decides which resources to load into the AI's context.
+
+| URI | Kind | Handler | Source |
+|---|---|---|---|
+| `hr://handbook` | Static | `hr_handbook()` | `resources/hr_handbook.md` (Markdown) |
+| `employees://{employee_id}` | Template | `employee_profile(employee_id)` | One row from `employees`, returned as an `Employee` in JSON |
+| `departments://{department}/employees` | Template | `department_roster(department)` | Matching rows, returned as an `EmployeeList` in JSON |
+
+```mermaid
+sequenceDiagram
+    participant C as MCP client
+    participant S as MCPServer (SDK)
+    participant H as Resource handler
+    participant DB as PostgreSQL
+
+    C->>S: resources/list, resources/templates/list
+    S-->>C: hr://handbook · employees://{employee_id} · departments://{department}/employees
+    C->>S: resources/read employees://3
+    S->>S: Match URI to template, extract employee_id = "3"
+    S->>H: employee_profile("3")
+    H->>DB: SELECT … WHERE id = 3
+    DB-->>H: row
+    H-->>S: Employee
+    S-->>C: contents [{uri, mimeType: application/json, text: {...}}]
+```
+
+- **Static vs template.** The SDK treats any URI containing `{placeholders}` as a template and matches incoming URIs against it. Static resources and templates are listed separately.
+- **Template values arrive as text.** `employee_profile` accepts `employee_id` as a string and checks that it's a number itself. If the parameter were typed `int`, a URI like `employees://abc` would fail inside the SDK with a generic internal error and a stack trace. Checking it in the handler gives a clear "not found" instead.
+- **Errors are protocol errors.** Unlike tools, a failed read doesn't return an `is_error` result. Handlers raise `ResourceNotFoundError`, which the client receives as `MCPError` code `-32602`, or `ResourceError`, which it receives as code `-32603`. The `resource_errors()` context manager turns the `ToolError`s raised by `employees_db()` into `ResourceError`s, so the database helper is shared between tools and resources.
+- **Helpful not-found messages.** An unknown department lists the departments that do exist, so the client or AI can correct itself.
+- **Same logging.** Resource handlers use `log_call` too. `ResourceError` is treated as an expected failure (a warning without a stack trace), like `ToolError`.
+- **Data access.** Resources expose the same data as `get_employees`, but through a different access pattern. A client can attach `employees://3` to a conversation without the AI deciding to call a tool.
+
 ## Timeouts and cancellation
 
 `long_running_task(duration_seconds, timeout_seconds)` simulates a slow job and sends a progress notification every second. It shows the two ways a call can run out of time.
@@ -236,6 +274,7 @@ sequenceDiagram
 | stdio transport | This is the standard way to run a local MCP server. The client manages the server process, and no network port or authentication is needed. |
 | Type hints as the contract | One source of truth: the SDK builds both the schema the AI sees and the input validation from the function signature. |
 | Server-side confirmation (elicitation) for deletes, refusing if the client can't prompt | Annotations are only hints. For an action that can't be undone, the server enforces the "ask first" rule itself and fails safe. |
+| Resources for read-only reference data, next to the read tools | The client or user can attach data (a policy document, a profile) to the conversation directly, without the AI having to decide to call a tool |
 | `ToolError` for expected failures | The caller gets a clear, useful message, and the server keeps running. |
 | A logging decorator instead of logging in each tool | Every tool is logged the same way, and adding a tool doesn't need any logging code. |
 | Pydantic models as tool results | Clients get a detailed output schema, rows are validated, and type conversion (`Decimal`, `date`) is handled in one place. |

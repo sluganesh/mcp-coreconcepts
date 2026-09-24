@@ -12,6 +12,7 @@ A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server w
 - **Logging:** a decorator records every tool call with its arguments, result and duration. Logs never go to stdout, because the stdio transport uses stdout for protocol messages.
 - **Typed results:** `get_employees` returns Pydantic models, so clients get a detailed output schema (field names, types and descriptions), and every row is checked before it's returned.
 - **Write tools with tool annotations:** create, update and delete tools run in database transactions and check their inputs (email format, salary above 0). Each tool is marked as read-only, destructive or idempotent, so clients can decide which calls need the user's approval.
+- **Resources and resource templates:** read-only data a client can load into the AI's context: an HR handbook, `employees://{employee_id}` profiles and `departments://{department}/employees` rosters.
 - **Elicitation (asking the user partway through a call):** `delete_employee` pauses to ask the user to confirm, and deletes only on an explicit "yes". It refuses to run on clients that can't show the prompt.
 - **Database access:** parameterized SQL queries, transactions that roll back on failure, and connection timeouts.
 - **Reproducible setup:** Docker Compose starts Postgres with a health check and loads sample data automatically.
@@ -74,14 +75,30 @@ Annotations let a client ask before running a tool, but nothing forces it to. Fo
 - **Server-side timeout.** The tool wraps its work in `asyncio.wait_for`. When `timeout_seconds` runs out, the work is cancelled and the client gets a normal error result: `Task timed out after 3s (it needed 8s)`.
 - **Client-side timeout.** The caller passes `read_timeout_seconds` to `call_tool` and handles the `MCPError` raised when time runs out. The SDK also sends the server a cancellation message. The server stops the task and logs `CANCELLED long_running_task after 2.00 s`, so no work is left running in the background.
 
+## Resources
+
+Resources are read-only data identified by a URI. A **tool** is an action the AI decides to call. A **resource** is content the user or the client application chooses to load into the AI's context, like attaching a document to a chat.
+
+| URI | Kind | Type | Contents |
+|---|---|---|---|
+| `hr://handbook` | Static | `text/markdown` | Company policies: working hours, leave, salaries, expenses and onboarding. Read from [resources/hr_handbook.md](resources/hr_handbook.md). |
+| `employees://{employee_id}` | Template | `application/json` | One employee's record, for example `employees://3` |
+| `departments://{department}/employees` | Template | `application/json` | Everyone in a department, for example `departments://engineering/employees` (not case-sensitive) |
+
+A **template** is a URI pattern with placeholders. Clients get templates from a separate listing (`resources/templates/list`) and fill in the values themselves.
+
+Resource errors reach the client as protocol errors (`MCPError`), not as tool-style `is_error` results:
+- Code `-32602` for anything that doesn't exist: an unknown employee id, an id that isn't a number, an unknown department (the message lists the real departments), or a URI that matches nothing.
+- Code `-32603` for other failures, such as the database being down.
+
 ## Getting started
 
 **Prerequisites:** Python 3.12 or later, Docker, and Node.js (only needed for the browser-based Inspector).
 
 ```bash
 # 1. Clone the repository and install dependencies
-git clone https://github.com/sluganesh/mcp-learning.git
-cd mcp-learning
+git clone https://github.com/sluganesh/mcp-coreconcepts.git
+cd mcp-coreconcepts
 python -m venv .venv
 .venv\Scripts\activate          # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
@@ -118,6 +135,15 @@ delete_employee({'employee_id': 17}) -> ERROR: Error executing tool delete_emplo
     answer: accept {'confirm': True}
 delete_employee({'employee_id': 17}) -> OK: {'id': 17, 'first_name': 'Test', ...}
 delete_employee({'employee_id': 17}) -> ERROR: Error executing tool delete_employee: No employee found with id 17.
+Resources: [('hr://handbook', 'text/markdown')]
+Resource templates: ['employees://{employee_id}', 'departments://{department}/employees']
+read hr://handbook -> OK (text/markdown): # Example Corp Employee Handbook ...
+read employees://3 -> OK (application/json): {"id": 3, "first_name": "Rahul", "last_name": "Verma", ...
+read departments://engineering/employees -> OK (application/json): {"employees": [{"id": 1, "first_name": "Aarav", ...
+read employees://999 -> MCPError -32602: No employee found with id 999.
+read employees://abc -> MCPError -32602: 'abc' is not a valid employee id. Ids are whole numbers.
+read departments://Legal/employees -> MCPError -32602: No department named 'Legal'. Departments: Engineering, Finance, HR, Marketing, Sales.
+read payroll://2026 -> MCPError -32602: Unknown resource: payroll://2026
 long_running_task({'duration_seconds': 2, 'timeout_seconds': 5}):
     progress: 1/2 - 1s of 2s done
     progress: 2/2 - 2s of 2s done
@@ -177,6 +203,7 @@ The database uses port **5433** so it doesn't clash with a Postgres server that 
 server.py            MCP server: tools, logging decorator, database access
 test_client.py       End-to-end test that talks to the server over stdio
 db/init.sql          Employees table and sample data
+resources/           Static resource content (HR handbook)
 docs/ARCHITECTURE.md Design, request flow, error handling, timeouts
 docker-compose.yml   PostgreSQL 16 container with health check
 requirements.txt     Python dependencies

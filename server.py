@@ -1,4 +1,5 @@
-"""A minimal local MCP server with math tools, employee read/write tools, and a
+"""A minimal local MCP server with math tools, employee read/write tools,
+read-only resources (HR handbook, employee profiles, department rosters), and a
 long-running task that demonstrates timeouts.
 
 Every tool call is logged to mcp_calls.log (and stderr). Nothing is logged to
@@ -18,13 +19,14 @@ from pathlib import Path
 from typing import Annotated
 
 import psycopg
-from psycopg.rows import class_row
+from psycopg.rows import class_row, dict_row
 from pydantic import BaseModel, Field
 from mcp.server.mcpserver import Context, MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ResourceError, ResourceNotFoundError, ToolError
 from mcp.types import ToolAnnotations
 
 LOG_FILE = Path(__file__).with_name("mcp_calls.log")
+HANDBOOK_FILE = Path(__file__).parent / "resources" / "hr_handbook.md"
 
 # Matches docker-compose.yml; override with the DATABASE_URL environment variable.
 DATABASE_URL = os.environ.get(
@@ -74,10 +76,17 @@ logger = logging.getLogger("mcp-learning")
 mcp = MCPServer("learning-server")
 
 
-def log_call(func):
-    """Log each tool call's name, arguments, result, and duration.
+# Anticipated, user-facing failures: logged as warnings without a stack trace.
+EXPECTED_ERRORS = (ToolError, ResourceError)
 
-    Works for both sync and async tools. Apply it below @mcp.tool(): wraps()
+# Longer results (e.g. the whole handbook) are cut short in the log.
+MAX_LOGGED_RESULT = 500
+
+
+def log_call(func):
+    """Log each tool or resource call's name, arguments, result, and duration.
+
+    Works for both sync and async functions. Apply it below @mcp.tool(): wraps()
     keeps the original signature, which the SDK uses to build the tool's
     input schema.
     """
@@ -91,7 +100,10 @@ def log_call(func):
 
     def log_result(result, start):
         elapsed_ms = (time.perf_counter() - start) * 1000
-        logger.info("RESULT %s -> %r (%.2f ms)", name, result, elapsed_ms)
+        shown = repr(result)
+        if len(shown) > MAX_LOGGED_RESULT:
+            shown = f"{shown[:MAX_LOGGED_RESULT]}... ({len(shown)} chars)"
+        logger.info("RESULT %s -> %s (%.2f ms)", name, shown, elapsed_ms)
 
     if inspect.iscoroutinefunction(func):
 
@@ -100,7 +112,7 @@ def log_call(func):
             start = log_start(args, kwargs)
             try:
                 result = await func(*args, **kwargs)
-            except ToolError as exc:
+            except EXPECTED_ERRORS as exc:
                 logger.warning("FAILED %s: %s", name, exc)
                 raise
             except asyncio.CancelledError:
@@ -122,7 +134,7 @@ def log_call(func):
         start = log_start(args, kwargs)
         try:
             result = func(*args, **kwargs)
-        except ToolError as exc:
+        except EXPECTED_ERRORS as exc:
             # Expected, user-facing error: log it without a stack trace.
             logger.warning("FAILED %s: %s", name, exc)
             raise
@@ -346,6 +358,76 @@ async def delete_employee(ctx: Context, employee_id: EmployeeId) -> Employee:
         raise ToolError(f"Deletion was not confirmed. Employee {employee_id} was not deleted.")
 
     return await asyncio.to_thread(remove_employee, employee_id)
+
+
+# --- Resources --------------------------------------------------------------
+# Resources are read-only data the client or user chooses to load into the
+# AI's context. Tools are actions the AI decides to call. Resource failures
+# reach the client as protocol errors (MCPError), not as is_error results.
+
+
+@contextmanager
+def resource_errors():
+    """Report database failures as ResourceErrors instead of ToolErrors."""
+    try:
+        yield
+    except ToolError as exc:
+        raise ResourceError(str(exc)) from exc
+
+
+@mcp.resource(
+    "hr://handbook",
+    title="Employee handbook",
+    description="Company policies: working hours, leave, salaries, expenses and onboarding.",
+    mime_type="text/markdown",
+)
+@log_call
+def hr_handbook() -> str:
+    return HANDBOOK_FILE.read_text(encoding="utf-8")
+
+
+@mcp.resource(
+    "employees://{employee_id}",
+    title="Employee profile",
+    description="One employee's record, by id.",
+    mime_type="application/json",
+)
+@log_call
+def employee_profile(employee_id: str) -> Employee:
+    # Template values arrive as text. Checking here gives a clear "not found"
+    # for a URI like employees://abc, instead of a generic conversion error.
+    if not employee_id.isdigit():
+        raise ResourceNotFoundError(f"'{employee_id}' is not a valid employee id. Ids are whole numbers.")
+    with resource_errors(), employees_db() as conn:
+        employee = conn.execute(
+            f"SELECT {EMPLOYEE_COLUMNS} FROM employees WHERE id = %s", (employee_id,)
+        ).fetchone()
+    if employee is None:
+        raise ResourceNotFoundError(f"No employee found with id {employee_id}.")
+    return employee
+
+
+@mcp.resource(
+    "departments://{department}/employees",
+    title="Department roster",
+    description="Everyone in a department, e.g. departments://Engineering/employees. Not case-sensitive.",
+    mime_type="application/json",
+)
+@log_call
+def department_roster(department: str) -> EmployeeList:
+    with resource_errors(), employees_db() as conn:
+        rows = conn.execute(
+            f"SELECT {EMPLOYEE_COLUMNS} FROM employees WHERE lower(department) = lower(%s) ORDER BY id",
+            (department,),
+        ).fetchall()
+        if not rows:
+            # Tell the reader which departments do exist.
+            known = conn.cursor(row_factory=dict_row).execute(
+                "SELECT string_agg(DISTINCT department, ', ' ORDER BY department) AS names FROM employees"
+            ).fetchone()["names"]
+    if not rows:
+        raise ResourceNotFoundError(f"No department named '{department}'. Departments: {known}.")
+    return EmployeeList(employees=rows, count=len(rows))
 
 
 # Upper bound for both arguments, so a caller can't tie the server up indefinitely.

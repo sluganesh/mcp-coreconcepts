@@ -48,6 +48,7 @@ async def main():
                     print(f"get_employees({args}) -> OK: {data['count']} row(s), first: {data['employees'][0]}")
 
             await test_write_tools(session)
+            await test_resources(session)
             await test_long_running_task(session)
 
 
@@ -108,6 +109,30 @@ async def test_delete_confirmation(session, employee_id):
     elicitation_answers.append(types.ElicitResult(action="accept", content={"confirm": True}))
     show("delete_employee", args, await session.call_tool("delete_employee", args))
     show("delete_employee", args, await session.call_tool("delete_employee", args))
+
+
+async def test_resources(session):
+    print("Resources:", [(str(r.uri), r.mime_type) for r in (await session.list_resources()).resources])
+    templates = (await session.list_resource_templates()).resource_templates
+    print("Resource templates:", [t.uri_template for t in templates])
+
+    for uri in (
+        "hr://handbook",
+        "employees://3",
+        "departments://engineering/employees",
+        "employees://999",                    # no such employee
+        "employees://abc",                    # not an integer
+        "departments://Legal/employees",      # no such department
+        "payroll://2026",                     # nothing registered for this URI
+    ):
+        # Unlike tools, resource failures are raised as protocol errors.
+        try:
+            content = (await session.read_resource(uri)).contents[0]
+        except MCPError as exc:
+            print(f"read {uri} -> MCPError {exc.code}: {exc}")
+            continue
+        preview = content.text if len(content.text) < 200 else content.text[:120].replace("\n", " ") + "..."
+        print(f"read {uri} -> OK ({content.mime_type}): {preview}")
 
 
 async def show_progress(progress, total, message):
