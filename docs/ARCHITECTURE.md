@@ -9,11 +9,12 @@ This document explains how the MCP Learning Server is put together: its componen
 3. [Life of a tool call](#life-of-a-tool-call)
 4. [Error handling](#error-handling)
 5. [Tool annotations](#tool-annotations)
-6. [Timeouts and cancellation](#timeouts-and-cancellation)
-7. [Logging](#logging)
-8. [Data layer](#data-layer)
-9. [Design decisions](#design-decisions)
-10. [Known limitations](#known-limitations)
+6. [Elicitation: confirming deletes](#elicitation-confirming-deletes)
+7. [Timeouts and cancellation](#timeouts-and-cancellation)
+8. [Logging](#logging)
+9. [Data layer](#data-layer)
+10. [Design decisions](#design-decisions)
+11. [Known limitations](#known-limitations)
 
 ## Overview
 
@@ -107,7 +108,7 @@ sequenceDiagram
 Notes:
 - **Registration.** Each tool is registered as `@mcp.tool(annotations=...)` stacked on `@log_call`. `log_call` uses `functools.wraps`, which keeps the original function's signature visible, so the SDK still builds the correct schema from it.
 - **Input constraints.** Rules such as `salary > 0`, an email pattern and text length limits are written into the signature as `Annotated[type, Field(...)]`. They appear in the input schema (for example `"exclusiveMinimum": 0`, `"pattern": ...`), so clients know them in advance, and the SDK rejects bad input before the tool runs.
-- **Sync vs async tools.** The SDK runs synchronous tools (the math and employee tools) on a worker thread through `anyio.to_thread.run_sync`, so a blocking database call doesn't stall the event loop. Async tools (`long_running_task`) run directly on the event loop.
+- **Sync vs async tools.** The SDK runs synchronous tools (the math tools and most employee tools) on a worker thread through `anyio.to_thread.run_sync`, so a blocking database call doesn't stall the event loop. Async tools (`long_running_task` and `delete_employee`) run directly on the event loop, so `delete_employee` moves its own database calls onto a worker thread with `asyncio.to_thread`.
 - **Return values.** The SDK builds each tool's output schema from its return type.
   - `get_employees` returns a Pydantic model, `EmployeeList` (`{"employees": [...], "count": n}`). The write tools return a single `Employee`: the record as it is after the change, or, for `delete_employee`, the record that was removed. The schema therefore lists every field with its type and description, for example `salary` as a number described as "Annual salary in USD" and `hire_date` as a string with `"format": "date"`.
   - Simple return types such as `int` or `str` are wrapped by the SDK as `{"result": ...}` in `structured_content`.
@@ -144,6 +145,43 @@ How the values were chosen:
 - `destructive_hint` and `idempotent_hint` only matter when `read_only_hint` is false, so the read-only tools leave `destructive_hint` unset.
 
 Clients use these hints to decide how to treat each call, for example running read-only tools without asking and asking the user before destructive ones. They are only hints: the server doesn't enforce them, and they are no substitute for real authorization.
+
+## Elicitation: confirming deletes
+
+Annotations leave it to the client to ask before a destructive call. For `delete_employee`, the server asks the user itself, using MCP elicitation, which lets a tool pause and request input from the user.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant C as MCP client
+    participant S as delete_employee
+    participant DB as PostgreSQL
+
+    C->>S: tools/call delete_employee {employee_id: 3}
+    S->>S: Client declared elicitation support?
+    alt no
+        S-->>C: is_error: "needs a client that supports confirmation prompts… Nothing was deleted."
+    else yes
+        S->>DB: SELECT employee 3
+        DB-->>S: Rahul Verma, Engineering Manager
+        S->>C: elicitation/create "Permanently delete Rahul Verma (id 3, …)?" + schema {confirm: bool}
+        C->>U: Show prompt
+        U-->>C: accept / decline / cancel
+        C-->>S: ElicitResult
+        alt accept with confirm = true
+            S->>DB: DELETE … RETURNING
+            S-->>C: deleted Employee record
+        else decline, cancel, or confirm = false
+            S-->>C: is_error: "…was not deleted."
+        end
+    end
+```
+
+- **Capability check.** A client declares elicitation support when it connects. In the Python SDK, it does so by passing an `elicitation_callback`. The tool checks `ctx.client_capabilities.elicitation` first, and refuses instead of deleting without asking. For a destructive action, that's the safe default.
+- **Three responses.** `accept` means the user submitted the form. `decline` means they explicitly said no. `cancel` means they dismissed the prompt. The form also has a `confirm` checkbox, so an `accept` with the box unchecked doesn't delete anything either.
+- **Looking up the record first.** The prompt shows the employee's name and role, so the user can confirm the right record. Unknown ids fail before any prompt is shown. If the record disappears while the user is deciding, the `DELETE … RETURNING` finds nothing and the tool reports "not found".
+- **Async tool, blocking database.** `delete_employee` is async so that it can `await ctx.elicit(...)`. Its database calls are blocking, so it runs them through `asyncio.to_thread` to keep the event loop free for other requests while it waits for the user.
+- **Audit log.** Every answer is logged, for example `ELICIT delete_employee id=17 -> accept confirm=True`.
 
 ## Timeouts and cancellation
 
@@ -197,6 +235,7 @@ sequenceDiagram
 |---|---|
 | stdio transport | This is the standard way to run a local MCP server. The client manages the server process, and no network port or authentication is needed. |
 | Type hints as the contract | One source of truth: the SDK builds both the schema the AI sees and the input validation from the function signature. |
+| Server-side confirmation (elicitation) for deletes, refusing if the client can't prompt | Annotations are only hints. For an action that can't be undone, the server enforces the "ask first" rule itself and fails safe. |
 | `ToolError` for expected failures | The caller gets a clear, useful message, and the server keeps running. |
 | A logging decorator instead of logging in each tool | Every tool is logged the same way, and adding a tool doesn't need any logging code. |
 | Pydantic models as tool results | Clients get a detailed output schema, rows are validated, and type conversion (`Decimal`, `date`) is handled in one place. |
@@ -209,6 +248,6 @@ These are deliberate simplifications for a learning project, with what a product
 - **A new database connection per call.** A connection pool (`psycopg_pool`) would avoid the setup cost of each call.
 - **Database queries can't be interrupted.** `get_employees` runs on a worker thread, so a client cancellation doesn't stop a query that's already running. An async tool with `psycopg.AsyncConnection` and a Postgres `statement_timeout` would make queries cancellable and time-limited.
 - **No automated test suite.** `test_client.py` is an end-to-end script that prints results rather than asserting them. The next step would be pytest tests that check `is_error` and returned values.
-- **Destructive tools don't ask for confirmation.** `update_employee_salary` and `delete_employee` rely on the client respecting their annotations. Using elicitation, the server could ask the user to confirm before it changes anything.
+- **Only deletes are confirmed.** `update_employee_salary` is also destructive, but it relies on the client respecting its annotations. The same elicitation pattern could confirm large salary changes, for example.
 - **No authentication.** That's appropriate for stdio, where only the parent process can talk to the server. The streamable HTTP transport would need an auth layer.
 - **Development credentials in `docker-compose.yml`.** Fine for a local sample database. A real deployment would load them from secrets.

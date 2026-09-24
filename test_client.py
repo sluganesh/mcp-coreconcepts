@@ -9,10 +9,25 @@ from mcp.client.stdio import stdio_client
 from mcp.shared.exceptions import MCPError
 
 
+SERVER = StdioServerParameters(command=sys.executable, args=["server.py"])
+
+# Scripted answers for confirmation prompts, used in order. A real client
+# would show the prompt to the user instead.
+elicitation_answers: list[types.ElicitResult] = []
+
+
+async def answer_elicitation(context, params):
+    answer = elicitation_answers.pop(0)
+    print(f"    prompt: {params.message}")
+    print(f"    answer: {answer.action} {answer.content or ''}")
+    return answer
+
+
 async def main():
-    params = StdioServerParameters(command=sys.executable, args=["server.py"])
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
+    async with stdio_client(SERVER) as (read, write):
+        # Passing an elicitation_callback makes the client declare that it
+        # supports elicitation, so the server may ask the user questions.
+        async with ClientSession(read, write, elicitation_callback=answer_elicitation) as session:
             await session.initialize()
             tools = await session.list_tools()
             print("Tools:", [t.name for t in tools.tools])
@@ -65,10 +80,34 @@ async def test_write_tools(session):
         ("create_employee", {**new, "email": "x@example.com", "salary": -5}),  # salary must be > 0
         ("update_employee_salary", {"employee_id": new_id, "new_salary": 55000}),
         ("update_employee_salary", {"employee_id": 999, "new_salary": 55000}),
-        ("delete_employee", {"employee_id": new_id}),
-        ("delete_employee", {"employee_id": new_id}),                   # already deleted
     ):
         show(name, args, await session.call_tool(name, args))
+
+    await test_delete_confirmation(session, new_id)
+
+
+async def test_delete_confirmation(session, employee_id):
+    args = {"employee_id": employee_id}
+    # Each answer is one way the user can respond to the confirmation prompt.
+    for answer in (
+        types.ElicitResult(action="decline"),
+        types.ElicitResult(action="cancel"),
+        types.ElicitResult(action="accept", content={"confirm": False}),
+    ):
+        elicitation_answers.append(answer)
+        show("delete_employee", args, await session.call_tool("delete_employee", args))
+
+    # A client without elicitation support is refused, and nothing is deleted.
+    async with stdio_client(SERVER) as (read, write):
+        async with ClientSession(read, write) as no_prompt_session:
+            await no_prompt_session.initialize()
+            print("  (client without elicitation support)")
+            show("delete_employee", args, await no_prompt_session.call_tool("delete_employee", args))
+
+    # Confirmed: the employee is deleted. A second attempt finds nothing, so no prompt is shown.
+    elicitation_answers.append(types.ElicitResult(action="accept", content={"confirm": True}))
+    show("delete_employee", args, await session.call_tool("delete_employee", args))
+    show("delete_employee", args, await session.call_tool("delete_employee", args))
 
 
 async def show_progress(progress, total, message):

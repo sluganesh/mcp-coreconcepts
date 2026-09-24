@@ -12,6 +12,7 @@ A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server w
 - **Logging:** a decorator records every tool call with its arguments, result and duration. Logs never go to stdout, because the stdio transport uses stdout for protocol messages.
 - **Typed results:** `get_employees` returns Pydantic models, so clients get a detailed output schema (field names, types and descriptions), and every row is checked before it's returned.
 - **Write tools with tool annotations:** create, update and delete tools run in database transactions and check their inputs (email format, salary above 0). Each tool is marked as read-only, destructive or idempotent, so clients can decide which calls need the user's approval.
+- **Elicitation (asking the user partway through a call):** `delete_employee` pauses to ask the user to confirm, and deletes only on an explicit "yes". It refuses to run on clients that can't show the prompt.
 - **Database access:** parameterized SQL queries, transactions that roll back on failure, and connection timeouts.
 - **Reproducible setup:** Docker Compose starts Postgres with a health check and loads sample data automatically.
 - **End-to-end testing:** a test client starts the server as a real MCP client would and calls every tool, covering both success and failure cases.
@@ -41,7 +42,7 @@ flowchart LR
 | `get_employees` | `employee_id: int` (optional) | `{"employees": [...], "count": n}`: all employees, or the one with that id | Unknown id; id less than 1; database unavailable |
 | `create_employee` | `first_name`, `last_name`, `email`, `department`, `job_title`, `salary`, `hire_date` (optional, defaults to today) | The new employee record | Duplicate email; invalid email; salary not above 0; empty or too-long text |
 | `update_employee_salary` | `employee_id: int`, `new_salary: float` | The updated employee record | Unknown id; salary not above 0 |
-| `delete_employee` | `employee_id: int` | The deleted employee record | Unknown id |
+| `delete_employee` | `employee_id: int` | The deleted employee record, after the user confirms | Unknown id; the user declined, cancelled or didn't confirm; client can't show a confirmation prompt |
 | `long_running_task` | `duration_seconds: float`, `timeout_seconds: float` (default 5) | A completion message, with a progress update every second | Task ran past its timeout; a value that isn't between 0 and 120 |
 
 ### Tool annotations
@@ -56,6 +57,15 @@ Each tool tells clients how it behaves. Clients can use these hints, for example
 | `delete_employee` | ❌ | ✅ | ✅ | Removes data; deleting the same id again changes nothing more |
 
 All tools set `open_world_hint` to false, because they only touch this server's own data. Annotations are hints: the server doesn't enforce them, and clients shouldn't treat them as a security boundary.
+
+### Confirming deletes (elicitation)
+
+Annotations let a client ask before running a tool, but nothing forces it to. For deletes, the server asks the user itself:
+
+1. `delete_employee` looks up the employee, then sends the client a prompt: *"Permanently delete Rahul Verma (id 3, Engineering Manager, Engineering)? This cannot be undone."* The prompt includes a `confirm` checkbox.
+2. The client shows the prompt, and the user replies in one of three ways: **accept** (with the box checked or not), **decline** or **cancel**.
+3. Only **accept** with `confirm` checked deletes the record. Every other answer returns an error saying nothing was deleted.
+4. If the client doesn't support elicitation, the tool refuses rather than deleting without asking.
 
 ### Timeouts
 
@@ -94,12 +104,20 @@ get_employees({}) -> OK: 10 row(s), first: {'id': 1, 'first_name': 'Aarav', ...}
 get_employees({'employee_id': 3}) -> OK: 1 row(s), first: {'id': 3, 'first_name': 'Rahul', ...}
 get_employees({'employee_id': 999}) -> ERROR: Error executing tool get_employees: No employee found with id 999.
 get_employees({'employee_id': 0}) -> ERROR: Error executing tool get_employees: 'employee_id' must be a positive integer.
-create_employee({... 'email': 'test.554db078@example.com', 'salary': 50000}) -> OK: {'id': 13, ..., 'hire_date': '2026-09-24'}
-create_employee({'first_name': 'Dup', ...}) -> ERROR: Error executing tool create_employee: An employee with email test.554db078@example.com already exists.
-update_employee_salary({'employee_id': 13, 'new_salary': 55000}) -> OK: {'id': 13, ..., 'salary': 55000.0, ...}
+create_employee({... 'email': 'test.cd83c531@example.com', 'salary': 50000}) -> OK: {'id': 17, ..., 'hire_date': '2026-09-24'}
+create_employee({'first_name': 'Dup', ...}) -> ERROR: Error executing tool create_employee: An employee with email test.cd83c531@example.com already exists.
+update_employee_salary({'employee_id': 17, 'new_salary': 55000}) -> OK: {'id': 17, ..., 'salary': 55000.0, ...}
 update_employee_salary({'employee_id': 999, 'new_salary': 55000}) -> ERROR: Error executing tool update_employee_salary: No employee found with id 999.
-delete_employee({'employee_id': 13}) -> OK: {'id': 13, 'first_name': 'Test', ...}
-delete_employee({'employee_id': 13}) -> ERROR: Error executing tool delete_employee: No employee found with id 13.
+    prompt: Permanently delete Test User (id 17, Tester, QA)? This cannot be undone.
+    answer: decline
+delete_employee({'employee_id': 17}) -> ERROR: Error executing tool delete_employee: The user declined. Employee 17 was not deleted.
+    ... (cancel, and accept without confirming, are refused the same way)
+  (client without elicitation support)
+delete_employee({'employee_id': 17}) -> ERROR: Error executing tool delete_employee: delete_employee needs a client that supports confirmation prompts (MCP elicitation). Nothing was deleted.
+    prompt: Permanently delete Test User (id 17, Tester, QA)? This cannot be undone.
+    answer: accept {'confirm': True}
+delete_employee({'employee_id': 17}) -> OK: {'id': 17, 'first_name': 'Test', ...}
+delete_employee({'employee_id': 17}) -> ERROR: Error executing tool delete_employee: No employee found with id 17.
 long_running_task({'duration_seconds': 2, 'timeout_seconds': 5}):
     progress: 1/2 - 1s of 2s done
     progress: 2/2 - 2s of 2s done

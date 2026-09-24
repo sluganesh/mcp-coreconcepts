@@ -268,6 +268,34 @@ def update_employee_salary(employee_id: EmployeeId, new_salary: Salary) -> Emplo
     return employee
 
 
+class DeleteConfirmation(BaseModel):
+    """What the user fills in when asked to confirm a deletion."""
+
+    confirm: bool = Field(description="Check to permanently delete this employee.")
+
+
+def find_employee(employee_id: int) -> Employee:
+    with employees_db() as conn:
+        employee = conn.execute(
+            f"SELECT {EMPLOYEE_COLUMNS} FROM employees WHERE id = %s", (employee_id,)
+        ).fetchone()
+    if employee is None:
+        raise ToolError(f"No employee found with id {employee_id}.")
+    return employee
+
+
+def remove_employee(employee_id: int) -> Employee:
+    with employees_db() as conn:
+        employee = conn.execute(
+            f"DELETE FROM employees WHERE id = %s RETURNING {EMPLOYEE_COLUMNS}",
+            (employee_id,),
+        ).fetchone()
+    # Someone else may have deleted it while the user was deciding.
+    if employee is None:
+        raise ToolError(f"No employee found with id {employee_id}.")
+    return employee
+
+
 # Removes data, so it's destructive. Idempotent: deleting the same id again
 # leaves the database in the same state (the second call reports "not found").
 @mcp.tool(
@@ -280,16 +308,44 @@ def update_employee_salary(employee_id: EmployeeId, new_salary: Salary) -> Emplo
     )
 )
 @log_call
-def delete_employee(employee_id: EmployeeId) -> Employee:
-    """Permanently delete an employee and return the record that was removed."""
-    with employees_db() as conn:
-        employee = conn.execute(
-            f"DELETE FROM employees WHERE id = %s RETURNING {EMPLOYEE_COLUMNS}",
-            (employee_id,),
-        ).fetchone()
-    if employee is None:
-        raise ToolError(f"No employee found with id {employee_id}.")
-    return employee
+async def delete_employee(ctx: Context, employee_id: EmployeeId) -> Employee:
+    """Permanently delete an employee and return the record that was removed.
+
+    The user is asked to confirm before anything is deleted.
+    """
+    # Refuse rather than delete without asking: this client can't show a prompt.
+    capabilities = ctx.client_capabilities
+    if capabilities is None or capabilities.elicitation is None:
+        raise ToolError(
+            "delete_employee needs a client that supports confirmation prompts "
+            "(MCP elicitation). Nothing was deleted."
+        )
+
+    # Database calls are blocking, so run them on a worker thread to keep the
+    # event loop free while this async tool waits.
+    employee = await asyncio.to_thread(find_employee, employee_id)
+
+    answer = await ctx.elicit(
+        message=(
+            f"Permanently delete {employee.first_name} {employee.last_name} "
+            f"(id {employee.id}, {employee.job_title}, {employee.department})? "
+            "This cannot be undone."
+        ),
+        schema=DeleteConfirmation,
+    )
+    logger.info(
+        "ELICIT delete_employee id=%s -> %s %s",
+        employee_id, answer.action, getattr(answer, "data", None) or "",
+    )
+
+    if answer.action == "decline":
+        raise ToolError(f"The user declined. Employee {employee_id} was not deleted.")
+    if answer.action == "cancel":
+        raise ToolError(f"The user cancelled. Employee {employee_id} was not deleted.")
+    if not answer.data.confirm:
+        raise ToolError(f"Deletion was not confirmed. Employee {employee_id} was not deleted.")
+
+    return await asyncio.to_thread(remove_employee, employee_id)
 
 
 # Upper bound for both arguments, so a caller can't tie the server up indefinitely.
