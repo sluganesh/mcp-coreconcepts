@@ -1,6 +1,7 @@
 """A minimal local MCP server with math tools, employee read/write tools,
-read-only resources (HR handbook, employee profiles, department rosters), and a
-long-running task that demonstrates timeouts.
+read-only resources (HR handbook, employee profiles, department rosters),
+HR prompts with argument completion, and a long-running task that
+demonstrates timeouts.
 
 Every tool call is logged to mcp_calls.log (and stderr). Nothing is logged to
 stdout, because the stdio transport uses stdout for MCP protocol messages.
@@ -23,7 +24,16 @@ from psycopg.rows import class_row, dict_row
 from pydantic import BaseModel, Field
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ResourceError, ResourceNotFoundError, ToolError
-from mcp.types import ToolAnnotations
+from mcp.server.mcpserver.prompts.base import Message, UserMessage
+from mcp.shared.exceptions import MCPError
+from mcp.types import (
+    INTERNAL_ERROR,
+    INVALID_PARAMS,
+    Completion,
+    EmbeddedResource,
+    TextResourceContents,
+    ToolAnnotations,
+)
 
 LOG_FILE = Path(__file__).with_name("mcp_calls.log")
 HANDBOOK_FILE = Path(__file__).parent / "resources" / "hr_handbook.md"
@@ -77,14 +87,14 @@ mcp = MCPServer("learning-server")
 
 
 # Anticipated, user-facing failures: logged as warnings without a stack trace.
-EXPECTED_ERRORS = (ToolError, ResourceError)
+EXPECTED_ERRORS = (ToolError, ResourceError, MCPError)
 
 # Longer results (e.g. the whole handbook) are cut short in the log.
 MAX_LOGGED_RESULT = 500
 
 
 def log_call(func):
-    """Log each tool or resource call's name, arguments, result, and duration.
+    """Log each tool, resource or prompt call's name, arguments, result, and duration.
 
     Works for both sync and async functions. Apply it below @mcp.tool(): wraps()
     keeps the original signature, which the SDK uses to build the tool's
@@ -420,14 +430,114 @@ def department_roster(department: str) -> EmployeeList:
             f"SELECT {EMPLOYEE_COLUMNS} FROM employees WHERE lower(department) = lower(%s) ORDER BY id",
             (department,),
         ).fetchall()
-        if not rows:
-            # Tell the reader which departments do exist.
-            known = conn.cursor(row_factory=dict_row).execute(
-                "SELECT string_agg(DISTINCT department, ', ' ORDER BY department) AS names FROM employees"
-            ).fetchone()["names"]
     if not rows:
+        # Tell the reader which departments do exist.
+        with resource_errors():
+            known = ", ".join(list_departments())
         raise ResourceNotFoundError(f"No department named '{department}'. Departments: {known}.")
     return EmployeeList(employees=rows, count=len(rows))
+
+
+def list_departments() -> list[str]:
+    with employees_db() as conn:
+        rows = conn.cursor(row_factory=dict_row).execute(
+            "SELECT DISTINCT department FROM employees ORDER BY department"
+        ).fetchall()
+    return [row["department"] for row in rows]
+
+
+# --- Prompts ----------------------------------------------------------------
+# Prompts are reusable, user-picked templates: the client shows them (e.g. as
+# slash commands), asks the user for the arguments, and sends the returned
+# messages to the AI. Prompt arguments always arrive as strings.
+
+
+@contextmanager
+def prompt_errors():
+    """Report failures as MCPErrors, the only kind a prompt passes through unchanged.
+
+    Any other exception reaches the client as a generic "Error rendering prompt".
+    """
+    try:
+        yield
+    except ResourceNotFoundError as exc:
+        raise MCPError(code=INVALID_PARAMS, message=str(exc)) from exc
+    except ResourceError as exc:
+        raise MCPError(code=INTERNAL_ERROR, message=str(exc)) from exc
+
+
+def embedded_resource(uri: str, mime_type: str, text: str) -> EmbeddedResource:
+    """Attach a resource's content to a prompt message, like attaching a file."""
+    return EmbeddedResource(
+        type="resource",
+        resource=TextResourceContents(uri=uri, mime_type=mime_type, text=text),
+    )
+
+
+@mcp.prompt(
+    title="Department headcount report",
+    description="Summarize a department's team: size, roles, tenure and salary range.",
+)
+@log_call
+def department_headcount_report(department: str) -> list[Message]:
+    with prompt_errors():
+        roster = department_roster(department)
+    uri = f"departments://{department}/employees"
+    return [
+        UserMessage(embedded_resource(uri, "application/json", roster.model_dump_json(indent=2))),
+        UserMessage(
+            f"Using the attached roster, write a short headcount report for the {department} department. "
+            "Include: the number of people, a breakdown by job title, average tenure in years "
+            f"(today is {date.today().isoformat()}), and the salary range and median. "
+            "Finish with one or two observations, such as a missing role or a single point of failure. "
+            "Salary information is confidential, so don't name individuals next to their salaries."
+        ),
+    ]
+
+
+@mcp.prompt(
+    title="Welcome email for a new hire",
+    description="Draft a welcome email for an employee, using their profile and the handbook.",
+)
+@log_call
+def welcome_email(employee_id: str, tone: str = "warm and professional") -> list[Message]:
+    with prompt_errors():
+        employee = employee_profile(employee_id)
+    return [
+        UserMessage(embedded_resource(f"employees://{employee_id}", "application/json", employee.model_dump_json(indent=2))),
+        UserMessage(embedded_resource("hr://handbook", "text/markdown", hr_handbook())),
+        UserMessage(
+            f"Draft a {tone} welcome email to {employee.first_name} {employee.last_name}, "
+            f"who is joining {employee.department} as {employee.job_title} on {employee.hire_date.isoformat()}. "
+            "Use the attached profile and handbook. Mention their onboarding buddy, the probation period "
+            "and core working hours. Don't mention salary. Keep it under 200 words and end with a subject line suggestion."
+        ),
+    ]
+
+
+# --- Completions ------------------------------------------------------------
+# Suggest values while the user fills in a prompt argument or a resource
+# template placeholder, e.g. typing "eng" suggests "Engineering".
+MAX_COMPLETIONS = 100
+
+
+@mcp.completion()
+async def complete_argument(ref, argument, context) -> Completion | None:
+    typed = argument.value.lower()
+    if argument.name == "department":
+        options = await asyncio.to_thread(list_departments)
+    elif argument.name == "employee_id":
+        options = [str(i) for i in await asyncio.to_thread(list_employee_ids)]
+    else:
+        return None
+    matches = [o for o in options if o.lower().startswith(typed)]
+    return Completion(values=matches[:MAX_COMPLETIONS], total=len(matches), has_more=len(matches) > MAX_COMPLETIONS)
+
+
+def list_employee_ids() -> list[int]:
+    with employees_db() as conn:
+        rows = conn.cursor(row_factory=dict_row).execute("SELECT id FROM employees ORDER BY id").fetchall()
+    return [row["id"] for row in rows]
 
 
 # Upper bound for both arguments, so a caller can't tie the server up indefinitely.

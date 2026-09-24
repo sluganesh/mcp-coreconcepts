@@ -11,11 +11,12 @@ This document explains how the MCP Learning Server is put together: its componen
 5. [Tool annotations](#tool-annotations)
 6. [Elicitation: confirming deletes](#elicitation-confirming-deletes)
 7. [Resources](#resources)
-8. [Timeouts and cancellation](#timeouts-and-cancellation)
-9. [Logging](#logging)
-10. [Data layer](#data-layer)
-11. [Design decisions](#design-decisions)
-12. [Known limitations](#known-limitations)
+8. [Prompts and completions](#prompts-and-completions)
+9. [Timeouts and cancellation](#timeouts-and-cancellation)
+10. [Logging](#logging)
+11. [Data layer](#data-layer)
+12. [Design decisions](#design-decisions)
+13. [Known limitations](#known-limitations)
 
 ## Overview
 
@@ -36,9 +37,11 @@ flowchart LR
         T5["create / update / delete<br/>employee (write)"]
         T4["long_running_task"]
         R["Resources<br/>hr://handbook · employees://{id}<br/>departments://{dept}/employees"]
+        P["Prompts<br/>headcount report · welcome email"]
         H["employees_db()<br/>transaction + error translation"]
         SDK --> LC
-        LC --> T1 & T2 & T3 & T5 & T4 & R
+        LC --> T1 & T2 & T3 & T5 & T4 & R & P
+        P -- "embeds" --> R
         T3 & T5 & R --> H
     end
 
@@ -61,6 +64,7 @@ flowchart LR
 | `log_call` decorator | `server.py` | Logs each call's arguments, result, duration and outcome, for both sync and async tools |
 | Tools | `server.py` | `add_integer`, `divide`, `get_employees`, `create_employee`, `update_employee_salary`, `delete_employee` and `long_running_task` |
 | Resources | `server.py`, `resources/hr_handbook.md` | `hr://handbook`, `employees://{employee_id}` and `departments://{department}/employees` |
+| Prompts and completions | `server.py` | `department_headcount_report` and `welcome_email`, plus autocomplete for `department` and `employee_id` |
 | `employees_db()` | `server.py` | Opens a database transaction for the employee tools and turns database errors into `ToolError`s |
 | Database | `docker-compose.yml`, `db/init.sql` | PostgreSQL 16 with an `employees` table and 10 sample rows |
 | Test client | `test_client.py` | Starts the server over stdio and calls every tool, covering success, failure and timeout cases |
@@ -219,7 +223,62 @@ sequenceDiagram
 - **Errors are protocol errors.** Unlike tools, a failed read doesn't return an `is_error` result. Handlers raise `ResourceNotFoundError`, which the client receives as `MCPError` code `-32602`, or `ResourceError`, which it receives as code `-32603`. The `resource_errors()` context manager turns the `ToolError`s raised by `employees_db()` into `ResourceError`s, so the database helper is shared between tools and resources.
 - **Helpful not-found messages.** An unknown department lists the departments that do exist, so the client or AI can correct itself.
 - **Same logging.** Resource handlers use `log_call` too. `ResourceError` is treated as an expected failure (a warning without a stack trace), like `ToolError`.
-- **Data access.** Resources expose the same data as `get_employees`, but through a different access pattern. A client can attach `employees://3` to a conversation without the AI deciding to call a tool.
+### Why expose the same data as both a tool and a resource
+
+`employees://{employee_id}` and `get_employees(employee_id)` return the same record. The overlap is deliberate: the two primitives differ in **who controls access**, not in what they return.
+
+| | Tool (`get_employees`) | Resource (`employees://{employee_id}`) |
+|---|---|---|
+| Controlled by | The model: the AI decides when to call it and with which arguments | The application or user: they choose what to attach to the context |
+| Typical use | Open-ended lookups and actions the AI works out itself | Context the user already has in mind, such as a specific profile or a policy document |
+| Side effects | Tools may write (see the write tools) | Always read-only |
+| Approval | Clients may ask the user before each call | No approval: reading isn't a tool call |
+| Discovery | Visible only when the AI uses it | Listed by the client, for example in a picker or with `@` mentions |
+| Change tracking | None | Clients can subscribe and be notified when the resource changes |
+
+A production server decides per piece of data. It uses a tool when the model should decide, a resource when the user should choose, and both only when both uses are real. The HR handbook is exposed only as a resource, because it's reference content, not something to act on.
+
+## Prompts and completions
+
+Prompts are reusable templates that the **user** invokes. Clients typically show them as a menu or as slash commands. The client collects the arguments, calls `prompts/get`, and sends the returned messages to the AI.
+
+| Prompt | Arguments | Messages returned |
+|---|---|---|
+| `department_headcount_report` | `department` | The department roster as an embedded resource, then instructions for the report |
+| `welcome_email` | `employee_id`, `tone` (optional) | The employee profile and the HR handbook as embedded resources, then instructions for the email |
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant C as MCP client
+    participant S as Server
+    participant DB as PostgreSQL
+
+    U->>C: Pick "Welcome email for a new hire"
+    C->>S: completion/complete {employee_id: "1"}
+    S-->>C: ["1", "10"]
+    U->>C: employee_id = 2, tone = friendly
+    C->>S: prompts/get welcome_email {employee_id: "2", tone: "friendly"}
+    S->>DB: SELECT employee 2
+    S-->>C: [profile (embedded), handbook (embedded), instructions]
+    C->>C: Send the messages to the AI
+```
+
+- **Prompts reuse resources.** The prompts call the resource handlers (`department_roster`, `employee_profile`, `hr_handbook`) and attach the results as `EmbeddedResource` content, with the same URIs and MIME types. The AI receives the data together with the instructions in a single turn, without making any tool calls.
+- **Guardrails live in the template.** The instructions tell the AI not to put names next to salaries and not to mention salary in the welcome email. Writing these rules once in the server is more reliable than depending on every user to remember them.
+- **Arguments are strings.** The MCP spec defines prompt arguments as strings, so the handlers reuse the same validation as the resource templates (for example, "'abc' is not a valid employee id").
+- **Error handling.** The SDK passes an `MCPError` raised by a prompt straight to the client, and turns any other exception into a generic "Error rendering prompt X". `prompt_errors()` therefore converts `ResourceNotFoundError` into `MCPError(-32602)` and `ResourceError` into `MCPError(-32603)`, so the user sees the real reason, such as "No department named 'Legal'. Departments: …".
+- **Completions.** One `@mcp.completion()` handler suggests values by argument name: `department` returns matching department names, and `employee_id` returns matching ids (at most 100, with `has_more` set when there are more). The same handler serves the prompt arguments and the resource template placeholders, because they share argument names.
+
+### How each primitive reports errors
+
+| Primitive | Controlled by | How a failure reaches the client | Raise in the handler |
+|---|---|---|---|
+| Tool | The AI | A normal result with `is_error: true`, which the AI can read and react to | `ToolError` |
+| Resource | The user or client app | A JSON-RPC error (`MCPError`) | `ResourceNotFoundError` (-32602), `ResourceError` (-32603) |
+| Prompt | The user | A JSON-RPC error (`MCPError`) | `MCPError` directly (see `prompt_errors()`) |
+
+Tool errors are results rather than protocol errors so that the AI can see what went wrong and try again. Resources and prompts are driven by the user or the app, so their failures are reported to the client as ordinary request errors.
 
 ## Timeouts and cancellation
 

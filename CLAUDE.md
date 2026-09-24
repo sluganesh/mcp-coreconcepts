@@ -18,6 +18,8 @@ npx @modelcontextprotocol/inspector .\.venv\Scripts\python.exe server.py   # bro
 docker exec -it mcp-learning-db psql -U mcp_user -d company                # SQL prompt
 ```
 
+The server is registered with Claude Code for this project (local scope) as `learning-server`. Its prompts only run as `/mcp__learning-server__<prompt>` in a Claude Code session started after the registration; the terminal CLI supports this.
+
 There is no pytest suite, linter, or build step. `test_client.py` is the only test: it's a plain script that prints each call's result or error. To exercise a single tool, edit the calls in that script or use the Inspector.
 
 ## Architecture and gotchas
@@ -30,6 +32,8 @@ There is no pytest suite, linter, or build step. `test_client.py` is the only te
 - **Tool annotations:** every tool passes `annotations=` to `@mcp.tool()`. Read-only tools use the shared `READ_ONLY` preset. Write tools set `destructive_hint` (true when existing data is overwritten or removed) and `idempotent_hint` explicitly, with a comment explaining the choice. Keep the annotations table in README.md in sync.
 - **Elicitation:** `delete_employee` is async so it can `await ctx.elicit(...)`. It checks `ctx.client_capabilities.elicitation` first and refuses if the client can't show prompts. It deletes only on `accept` with `confirm=True`. Its blocking database work runs through `asyncio.to_thread`, so the event loop stays free. In `test_client.py`, confirmation answers are scripted: queue an `ElicitResult` in `elicitation_answers` before each call.
 - **Resources:** registered with `@mcp.resource(uri, ...)` stacked on `@log_call`. A URI with `{placeholders}` becomes a template, and its values arrive as strings, so validate them in the handler (see `employee_profile`) rather than typing them as `int`. Resource failures raise `ResourceNotFoundError` or `ResourceError`, which clients receive as `MCPError` codes -32602 and -32603. Wrap database access in `resource_errors()` so `employees_db()`'s `ToolError`s become `ResourceError`s. Static content lives in `resources/`.
+- **Prompts:** registered with `@mcp.prompt(title=..., description=...)` stacked on `@log_call`. They return a list of `UserMessage`s, and live data is attached with `embedded_resource()`. Prompt arguments are always strings. Only `MCPError` reaches the client with its message intact; the SDK turns any other exception into "Error rendering prompt X". Wrap calls to resource helpers in `prompt_errors()`, which converts `ResourceNotFoundError` and `ResourceError` into `MCPError` codes -32602 and -32603.
+- **Completions:** a single `@mcp.completion()` handler, `complete_argument`, serves both prompt arguments and resource template placeholders. It matches on the argument's name (`department`, `employee_id`), so reusing those names elsewhere gets autocomplete for free.
 - **Input constraints** go in the signature as `Annotated[type, Field(...)]` (see `EmployeeId`, `Salary`, `Name`), so they appear in the input schema and the SDK enforces them before the tool runs.
 - **Error handling:**
   - For expected, user-facing failures, raise `ToolError("message")`. The client receives an `is_error` result carrying that message, and `log_call` logs it as a `WARNING` without a stack trace.

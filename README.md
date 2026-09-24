@@ -13,6 +13,7 @@ A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server w
 - **Typed results:** `get_employees` returns Pydantic models, so clients get a detailed output schema (field names, types and descriptions), and every row is checked before it's returned.
 - **Write tools with tool annotations:** create, update and delete tools run in database transactions and check their inputs (email format, salary above 0). Each tool is marked as read-only, destructive or idempotent, so clients can decide which calls need the user's approval.
 - **Resources and resource templates:** read-only data a client can load into the AI's context: an HR handbook, `employees://{employee_id}` profiles and `departments://{department}/employees` rosters.
+- **Prompts and autocomplete:** reusable HR templates (a department headcount report, a new-hire welcome email) that attach live data to the message, with autocomplete for department names and employee ids.
 - **Elicitation (asking the user partway through a call):** `delete_employee` pauses to ask the user to confirm, and deletes only on an explicit "yes". It refuses to run on clients that can't show the prompt.
 - **Database access:** parameterized SQL queries, transactions that roll back on failure, and connection timeouts.
 - **Reproducible setup:** Docker Compose starts Postgres with a health check and loads sample data automatically.
@@ -87,9 +88,44 @@ Resources are read-only data identified by a URI. A **tool** is an action the AI
 
 A **template** is a URI pattern with placeholders. Clients get templates from a separate listing (`resources/templates/list`) and fill in the values themselves.
 
+### Tools vs resources
+
+`employees://3` and `get_employees(employee_id=3)` return the same data. The difference is **who decides to fetch it**:
+
+| | Tool | Resource |
+|---|---|---|
+| Who's in control | The **AI** decides to call it | The **user or client app** chooses to attach it |
+| Best for | Lookups the AI works out for itself ("Who in Sales earns over 100k?"), and actions | Context the user already knows they want ("Here's Rahul's profile, draft his promotion letter") |
+| Can change data | Yes (`create_employee`, `delete_employee`) | No, always read-only |
+| Approval prompts | Clients may ask before each call | None: reading isn't a tool call |
+| How it's found | Hidden until the AI uses it | Clients can list and show it in a picker |
+| Updates | None | Clients can subscribe to change notifications |
+
+This project exposes employee data both ways on purpose, to show the contrast. A real server chooses per piece of data: tools where the AI should decide, resources where the user should choose. It offers both only when both kinds of use are real. The handbook, by contrast, is only a resource, because it's a document to read rather than something to act on.
+
 Resource errors reach the client as protocol errors (`MCPError`), not as tool-style `is_error` results:
 - Code `-32602` for anything that doesn't exist: an unknown employee id, an id that isn't a number, an unknown department (the message lists the real departments), or a URI that matches nothing.
 - Code `-32603` for other failures, such as the database being down.
+
+## Prompts
+
+Prompts are reusable templates the **user** picks, usually from a menu or as slash commands. The client asks for the arguments, the server builds the messages (attaching live data as embedded resources), and the result is sent to the AI.
+
+| Prompt | Arguments | What it sends to the AI |
+|---|---|---|
+| `department_headcount_report` | `department` | The department roster (attached) and instructions for a report covering team size, roles, average tenure and salary range, without naming individuals next to salaries |
+| `welcome_email` | `employee_id`, `tone` (optional, default "warm and professional") | The employee's profile and the HR handbook (both attached) and instructions for a welcome email mentioning the onboarding buddy, probation and core hours, but not salary |
+
+**Autocomplete:** while the user fills in `department` or `employee_id`, the client can ask the server for suggestions. For example, typing `eng` suggests `Engineering`. The same suggestions work for the `departments://{department}/employees` and `employees://{employee_id}` resource templates.
+
+**The three primitives side by side:**
+
+| | Tools | Resources | Prompts |
+|---|---|---|---|
+| Controlled by | The AI | The user or client app | The user |
+| Purpose | Take actions and look things up | Provide context to read | Start a task from a ready-made template |
+| Example here | `create_employee` | `hr://handbook` | `welcome_email` |
+| How errors reach the client | `is_error` result | `MCPError` | `MCPError` |
 
 ## Getting started
 
@@ -144,6 +180,20 @@ read employees://999 -> MCPError -32602: No employee found with id 999.
 read employees://abc -> MCPError -32602: 'abc' is not a valid employee id. Ids are whole numbers.
 read departments://Legal/employees -> MCPError -32602: No department named 'Legal'. Departments: Engineering, Finance, HR, Marketing, Sales.
 read payroll://2026 -> MCPError -32602: Unknown resource: payroll://2026
+Prompt: department_headcount_report(department) - Summarize a department's team: size, roles, tenure and salary range.
+Prompt: welcome_email(employee_id, tone?) - Draft a welcome email for an employee, using their profile and the handbook.
+get_prompt department_headcount_report({'department': 'Engineering'}) -> 2 messages:
+    [user] attached departments://Engineering/employees (application/json)
+    [user] Using the attached roster, write a short headcount report for the Engineering department. ...
+get_prompt welcome_email({'employee_id': '2', 'tone': 'friendly'}) -> 3 messages:
+    [user] attached employees://2 (application/json)
+    [user] attached hr://handbook (text/markdown)
+    [user] Draft a friendly welcome email to Priya Iyer, who is joining Engineering as Software Engineer on 2021-07-01. ...
+get_prompt department_headcount_report({'department': 'Legal'}) -> MCPError -32602: No department named 'Legal'. Departments: Engineering, Finance, HR, Marketing, Sales.
+get_prompt welcome_email({'employee_id': 'abc'}) -> MCPError -32602: 'abc' is not a valid employee id. Ids are whole numbers.
+complete {'name': 'department', 'value': 'eng'} -> ['Engineering']
+complete {'name': 'employee_id', 'value': '1'} -> ['1', '10']
+complete {'name': 'department', 'value': 'm'} -> ['Marketing']
 long_running_task({'duration_seconds': 2, 'timeout_seconds': 5}):
     progress: 1/2 - 1s of 2s done
     progress: 2/2 - 2s of 2s done
@@ -170,11 +220,21 @@ Open the URL it prints, click **Connect**, then go to **Tools** → **List Tools
 
 **From Claude Code:**
 
+The MCP Inspector shows what the server returns, but it has no AI, so a prompt stops at the generated messages. To see Claude act on them, connect the server to Claude Code:
+
 ```bash
 claude mcp add learning-server -- <path-to>/.venv/Scripts/python.exe <path-to>/server.py
 ```
 
-Then ask Claude something like *"Show me employee 3"* or *"What is 10 divided by 0?"*
+Then start a **new** Claude Code session in the project folder (for example, run `claude` in a terminal) and type `/mcp` to check that `learning-server` is connected. Servers are loaded when a session starts, so a conversation that was already open won't see it. Each primitive is used differently:
+
+| Primitive | How you use it | Example |
+|---|---|---|
+| Prompts | Run it as a slash command: `/mcp__<server>__<prompt> <arguments>` | `/mcp__learning-server__welcome_email 1 friendly` makes Claude write the welcome email |
+| Resources | Attach it with an `@` mention: `@<server>:<uri>` | `@learning-server:hr://handbook How much annual leave do we get?` |
+| Tools | Just ask. Claude decides when to call them | *"Who in Engineering earns more than 100k?"* calls `get_employees` |
+
+Prompts as slash commands work in the Claude Code terminal (CLI). The VS Code chat panel may not list MCP prompts as slash commands, so use the terminal to try them.
 
 ## Logging
 

@@ -49,6 +49,7 @@ async def main():
 
             await test_write_tools(session)
             await test_resources(session)
+            await test_prompts(session)
             await test_long_running_task(session)
 
 
@@ -133,6 +134,39 @@ async def test_resources(session):
             continue
         preview = content.text if len(content.text) < 200 else content.text[:120].replace("\n", " ") + "..."
         print(f"read {uri} -> OK ({content.mime_type}): {preview}")
+
+
+async def test_prompts(session):
+    for p in (await session.list_prompts()).prompts:
+        args = [f"{a.name}{'' if a.required else '?'}" for a in p.arguments or []]
+        print(f"Prompt: {p.name}({', '.join(args)}) - {p.description}")
+
+    for name, args in (
+        ("department_headcount_report", {"department": "Engineering"}),
+        ("welcome_email", {"employee_id": "2", "tone": "friendly"}),
+        ("department_headcount_report", {"department": "Legal"}),   # no such department
+        ("welcome_email", {"employee_id": "abc"}),                  # not a valid id
+    ):
+        try:
+            result = await session.get_prompt(name, args)
+        except MCPError as exc:
+            print(f"get_prompt {name}({args}) -> MCPError {exc.code}: {exc}")
+            continue
+        print(f"get_prompt {name}({args}) -> {len(result.messages)} messages:")
+        for m in result.messages:
+            if m.content.type == "resource":
+                print(f"    [{m.role}] attached {m.content.resource.uri} ({m.content.resource.mime_type})")
+            else:
+                print(f"    [{m.role}] {m.content.text[:110]}...")
+
+    # Autocomplete works for prompt arguments and resource template placeholders.
+    for ref, arg in (
+        (types.PromptReference(type="ref/prompt", name="department_headcount_report"), {"name": "department", "value": "eng"}),
+        (types.PromptReference(type="ref/prompt", name="welcome_email"), {"name": "employee_id", "value": "1"}),
+        (types.ResourceTemplateReference(type="ref/resource", uri="departments://{department}/employees"), {"name": "department", "value": "m"}),
+    ):
+        completion = (await session.complete(ref, arg)).completion
+        print(f"complete {arg} -> {completion.values}")
 
 
 async def show_progress(progress, total, message):
