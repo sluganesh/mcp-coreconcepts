@@ -27,8 +27,11 @@ async def main():
     async with stdio_client(SERVER) as (read, write):
         # Passing an elicitation_callback makes the client declare that it
         # supports elicitation, so the server may ask the user questions.
-        async with ClientSession(read, write, elicitation_callback=answer_elicitation) as session:
-            await session.initialize()
+        async with ClientSession(
+            read, write, elicitation_callback=answer_elicitation, logging_callback=show_log_message
+        ) as session:
+            init = await session.initialize()
+            print("Protocol version:", init.protocol_version)
             tools = await session.list_tools()
             print("Tools:", [t.name for t in tools.tools])
             result = await session.call_tool("add_integer", {"a": 7, "b": 35})
@@ -50,6 +53,7 @@ async def main():
             await test_write_tools(session)
             await test_resources(session)
             await test_prompts(session)
+            await test_bulk_import(session)
             await test_long_running_task(session)
 
 
@@ -167,6 +171,34 @@ async def test_prompts(session):
     ):
         completion = (await session.complete(ref, arg)).completion
         print(f"complete {arg} -> {completion.values}")
+
+
+async def show_log_message(params):
+    print(f"    log [{params.level}] {params.data}")
+
+
+async def test_bulk_import(session):
+    suffix = uuid.uuid4().hex[:6]
+    csv_text = f"""first_name,last_name,email,department,job_title,salary,hire_date
+Nisha,Rao,nisha.{suffix}@example.com,Engineering,Software Engineer,90000,
+Omar,Khan,omar.{suffix}@example.com,Sales,Account Executive,65000,2026-10-01
+Bad,Row,not-an-email,Sales,Intern,-100,
+Dup,Email,aarav.sharma@example.com,Engineering,Engineer,80000,
+"""
+    print("bulk_import_employees (4 rows: 2 valid, 1 invalid, 1 duplicate):")
+    result = await session.call_tool("bulk_import_employees", {"csv_text": csv_text})
+    summary = result.structured_content
+    print(f"  -> imported {summary['imported']}, skipped {summary['skipped']}, ids {summary['created_ids']}")
+    for problem in summary["problems"]:
+        print(f"     problem: {problem}")
+
+    result = await session.call_tool("bulk_import_employees", {"csv_text": "name,email\nX,x@example.com"})
+    print(f"bulk_import_employees (wrong header) -> ERROR: {result.content[0].text}")
+
+    # Clean up: delete the imported employees, confirming each prompt.
+    for employee_id in summary["created_ids"]:
+        elicitation_answers.append(types.ElicitResult(action="accept", content={"confirm": True}))
+        await session.call_tool("delete_employee", {"employee_id": employee_id})
 
 
 async def show_progress(progress, total, message):

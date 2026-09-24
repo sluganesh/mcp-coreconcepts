@@ -8,12 +8,15 @@ stdout, because the stdio transport uses stdout for MCP protocol messages.
 """
 
 import asyncio
+import csv
 import functools
+import io
 import inspect
 import logging
 import os
 import sys
 import time
+import warnings
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
@@ -21,11 +24,11 @@ from typing import Annotated
 
 import psycopg
 from psycopg.rows import class_row, dict_row
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ResourceError, ResourceNotFoundError, ToolError
 from mcp.server.mcpserver.prompts.base import Message, UserMessage
-from mcp.shared.exceptions import MCPError
+from mcp.shared.exceptions import MCPDeprecationWarning, MCPError
 from mcp.types import (
     INTERNAL_ERROR,
     INVALID_PARAMS,
@@ -89,8 +92,8 @@ mcp = MCPServer("learning-server")
 # Anticipated, user-facing failures: logged as warnings without a stack trace.
 EXPECTED_ERRORS = (ToolError, ResourceError, MCPError)
 
-# Longer results (e.g. the whole handbook) are cut short in the log.
-MAX_LOGGED_RESULT = 500
+# Long arguments and results (e.g. a CSV, the whole handbook) are cut short in the log.
+MAX_LOGGED_VALUE = 500
 
 
 def log_call(func):
@@ -102,18 +105,21 @@ def log_call(func):
     """
     name = func.__name__
 
+    def short(value):
+        text = repr(value)
+        if len(text) > MAX_LOGGED_VALUE:
+            text = f"{text[:MAX_LOGGED_VALUE]}... ({len(text)} chars)"
+        return text
+
     def log_start(args, kwargs):
         # The SDK-injected Context object is noise in the log, so leave it out.
         shown = {k: v for k, v in kwargs.items() if not isinstance(v, Context)}
-        logger.info("CALL %s args=%s kwargs=%s", name, args, shown)
+        logger.info("CALL %s args=%s kwargs=%s", name, args, short(shown))
         return time.perf_counter()
 
     def log_result(result, start):
         elapsed_ms = (time.perf_counter() - start) * 1000
-        shown = repr(result)
-        if len(shown) > MAX_LOGGED_RESULT:
-            shown = f"{shown[:MAX_LOGGED_RESULT]}... ({len(shown)} chars)"
-        logger.info("RESULT %s -> %s (%.2f ms)", name, shown, elapsed_ms)
+        logger.info("RESULT %s -> %s (%.2f ms)", name, short(result), elapsed_ms)
 
     if inspect.iscoroutinefunction(func):
 
@@ -368,6 +374,130 @@ async def delete_employee(ctx: Context, employee_id: EmployeeId) -> Employee:
         raise ToolError(f"Deletion was not confirmed. Employee {employee_id} was not deleted.")
 
     return await asyncio.to_thread(remove_employee, employee_id)
+
+
+# --- Bulk import (logging to the client) ------------------------------------
+# ctx.debug/info/warning send log messages to the client while the tool runs,
+# separate from the server's own log file. The client chooses which levels it
+# wants, so per-row detail goes out at debug and problems at warning.
+#
+# The MCP logging capability is deprecated as of the 2026-07-28 spec
+# (SEP-2577). It still works on earlier protocol versions, which is what most
+# clients use today. On 2026-07-28+ connections, messages are only sent when the
+# client opts in per request. So the tool's result, ImportSummary, carries every
+# problem too, and never depends on log messages arriving. The SDK warns on each
+# ctx.info() call; that warning is silenced here because the deprecation is
+# deliberate and documented (README and docs/ARCHITECTURE.md).
+warnings.filterwarnings(
+    "ignore", message="The logging capability is deprecated", category=MCPDeprecationWarning
+)
+
+MAX_IMPORT_ROWS = 1000
+IMPORT_COLUMNS = ["first_name", "last_name", "email", "department", "job_title", "salary"]
+
+
+class NewEmployee(BaseModel):
+    """One CSV row, checked with the same rules as create_employee."""
+
+    first_name: Name
+    last_name: Name
+    email: Annotated[str, Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", max_length=100)]
+    department: Name
+    job_title: Annotated[str, Field(min_length=1, max_length=100)]
+    salary: Salary
+    hire_date: date | None = None
+
+
+class ImportSummary(BaseModel):
+    """Result of bulk_import_employees."""
+
+    imported: int = Field(description="Number of employees added.")
+    skipped: int = Field(description="Number of rows that were not imported.")
+    created_ids: list[int] = Field(description="Ids of the employees added.")
+    problems: list[str] = Field(description="One line per skipped row, e.g. 'line 3: duplicate email'.")
+
+
+def insert_new_employees(rows: list[tuple[int, NewEmployee]]) -> list[tuple[int, Employee | str]]:
+    """Insert rows one by one; return each line number with the new record or a problem."""
+    outcomes = []
+    with employees_db() as conn:
+        for line, row in rows:
+            try:
+                # A nested transaction is a savepoint: a duplicate only undoes its own row.
+                with conn.transaction():
+                    employee = conn.execute(
+                        f"""
+                        INSERT INTO employees (first_name, last_name, email, department, job_title, salary, hire_date)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        RETURNING {EMPLOYEE_COLUMNS}
+                        """,
+                        (row.first_name, row.last_name, row.email, row.department, row.job_title,
+                         row.salary, row.hire_date or date.today()),
+                    ).fetchone()
+                outcomes.append((line, employee))
+            except psycopg.errors.UniqueViolation:
+                outcomes.append((line, f"an employee with email {row.email} already exists"))
+    return outcomes
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Bulk import employees",
+        read_only_hint=False,
+        destructive_hint=False,
+        idempotent_hint=False,
+        open_world_hint=False,
+    )
+)
+@log_call
+async def bulk_import_employees(
+    ctx: Context,
+    csv_text: Annotated[
+        str,
+        Field(description=(
+            "CSV text with a header row. Columns: first_name, last_name, email, department, "
+            "job_title, salary, and optionally hire_date (YYYY-MM-DD, defaults to today)."
+        )),
+    ],
+) -> ImportSummary:
+    """Add many employees from CSV. Valid rows are imported; invalid or duplicate rows are skipped and reported."""
+    reader = csv.DictReader(io.StringIO(csv_text.strip()))
+    missing = [c for c in IMPORT_COLUMNS if c not in (reader.fieldnames or [])]
+    if missing:
+        raise ToolError(f"The CSV header is missing these columns: {', '.join(missing)}.")
+    records = [(reader.line_num, record) for record in reader]
+    if not records:
+        raise ToolError("The CSV has a header but no rows.")
+    if len(records) > MAX_IMPORT_ROWS:
+        raise ToolError(f"Too many rows ({len(records)}). Import at most {MAX_IMPORT_ROWS} at a time.")
+
+    await ctx.info(f"Importing {len(records)} rows.")
+    problems: list[str] = []
+
+    # 1. Check every row, and report the invalid ones as they're found.
+    valid: list[tuple[int, NewEmployee]] = []
+    for line, record in records:
+        try:
+            valid.append((line, NewEmployee.model_validate({k: v or None for k, v in record.items()})))
+        except ValidationError as exc:
+            reason = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
+            problems.append(f"line {line}: {reason}")
+            await ctx.warning(f"Skipped line {line}: {reason}")
+
+    # 2. Insert the valid rows. Database work is blocking, so it runs on a worker thread.
+    created_ids: list[int] = []
+    for line, outcome in await asyncio.to_thread(insert_new_employees, valid):
+        if isinstance(outcome, str):
+            problems.append(f"line {line}: {outcome}")
+            await ctx.warning(f"Skipped line {line}: {outcome}")
+        else:
+            created_ids.append(outcome.id)
+            await ctx.debug(f"Imported line {line}: {outcome.first_name} {outcome.last_name} (id {outcome.id})")
+
+    await ctx.info(f"Import finished: {len(created_ids)} imported, {len(problems)} skipped.")
+    return ImportSummary(
+        imported=len(created_ids), skipped=len(problems), created_ids=created_ids, problems=problems
+    )
 
 
 # --- Resources --------------------------------------------------------------

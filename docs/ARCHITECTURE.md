@@ -12,11 +12,12 @@ This document explains how the MCP Learning Server is put together: its componen
 6. [Elicitation: confirming deletes](#elicitation-confirming-deletes)
 7. [Resources](#resources)
 8. [Prompts and completions](#prompts-and-completions)
-9. [Timeouts and cancellation](#timeouts-and-cancellation)
-10. [Logging](#logging)
-11. [Data layer](#data-layer)
-12. [Design decisions](#design-decisions)
-13. [Known limitations](#known-limitations)
+9. [Bulk import and logging to the client](#bulk-import-and-logging-to-the-client)
+10. [Timeouts and cancellation](#timeouts-and-cancellation)
+11. [Logging](#logging)
+12. [Data layer](#data-layer)
+13. [Design decisions](#design-decisions)
+14. [Known limitations](#known-limitations)
 
 ## Overview
 
@@ -62,7 +63,7 @@ flowchart LR
 |---|---|---|
 | MCP server | `server.py` | Registers the tools, runs the stdio transport, and holds all tool logic |
 | `log_call` decorator | `server.py` | Logs each call's arguments, result, duration and outcome, for both sync and async tools |
-| Tools | `server.py` | `add_integer`, `divide`, `get_employees`, `create_employee`, `update_employee_salary`, `delete_employee` and `long_running_task` |
+| Tools | `server.py` | `add_integer`, `divide`, `get_employees`, `create_employee`, `update_employee_salary`, `delete_employee`, `bulk_import_employees` and `long_running_task` |
 | Resources | `server.py`, `resources/hr_handbook.md` | `hr://handbook`, `employees://{employee_id}` and `departments://{department}/employees` |
 | Prompts and completions | `server.py` | `department_headcount_report` and `welcome_email`, plus autocomplete for `department` and `employee_id` |
 | `employees_db()` | `server.py` | Opens a database transaction for the employee tools and turns database errors into `ToolError`s |
@@ -141,7 +142,7 @@ Every tool declares how it behaves, using the MCP tool annotations:
 | Tool | `read_only_hint` | `destructive_hint` | `idempotent_hint` | `open_world_hint` |
 |---|---|---|---|---|
 | `add_integer`, `divide`, `get_employees`, `long_running_task` | true | — | true | false |
-| `create_employee` | false | false | false | false |
+| `create_employee`, `bulk_import_employees` | false | false | false | false |
 | `update_employee_salary` | false | true | true | false |
 | `delete_employee` | false | true | true | false |
 
@@ -279,6 +280,44 @@ sequenceDiagram
 | Prompt | The user | A JSON-RPC error (`MCPError`) | `MCPError` directly (see `prompt_errors()`) |
 
 Tool errors are results rather than protocol errors so that the AI can see what went wrong and try again. Resources and prompts are driven by the user or the app, so their failures are reported to the client as ordinary request errors.
+
+## Bulk import and logging to the client
+
+`bulk_import_employees(csv_text)` imports many employees at once and reports what it's doing while it runs.
+
+```mermaid
+sequenceDiagram
+    participant C as MCP client
+    participant S as bulk_import_employees
+    participant DB as PostgreSQL
+
+    C->>S: tools/call {csv_text}
+    S->>S: Check header (missing columns → ToolError), row count (max 1,000)
+    S-->>C: log info "Importing 4 rows."
+    loop each row
+        S->>S: Validate with NewEmployee (same rules as create_employee)
+        S-->>C: log warning "Skipped line 4: …" (invalid rows)
+    end
+    S->>DB: BEGIN
+    loop each valid row
+        S->>DB: SAVEPOINT; INSERT … RETURNING
+        alt duplicate email
+            DB-->>S: UniqueViolation → ROLLBACK TO SAVEPOINT
+            S-->>C: log warning "Skipped line 5: … already exists"
+        else ok
+            S-->>C: log debug "Imported line 2: Nisha Rao (id 32)"
+        end
+    end
+    S->>DB: COMMIT
+    S-->>C: log info "Import finished: 2 imported, 2 skipped."
+    S-->>C: ImportSummary {imported, skipped, created_ids, problems}
+```
+
+- **Best effort, not all-or-nothing.** A problem with one row doesn't stop the others. Validation errors are caught before anything is written. A duplicate email is caught by the database, and a nested transaction (a savepoint) rolls back only that row. Header, row-count and connection problems are still `ToolError`s, because they mean no row can be imported at all.
+- **Choosing log levels.** Per-row successes are `debug`, skipped rows are `warning`, and the start and finish messages are `info`. A client that only wants problems can ask for `warning` and above.
+- **Client log vs server log.** `ctx.info()` and similar calls send `notifications/message` to the client, which may show them to the user. `mcp_calls.log` is the operator's own log. The two are independent.
+- **Async tool, blocking database.** Validation and logging run on the event loop. The inserts run in one `asyncio.to_thread` call, and their results are then reported to the client.
+- **Protocol deprecation.** The MCP 2026-07-28 revision (SEP-2577) deprecates the logging capability. On earlier protocol versions, which this project's client negotiates (2025-11-25), every level is delivered. On 2026-07-28+ connections, a server only sends log messages for requests where the client opts in through `_meta`. `ImportSummary` therefore repeats every problem, so callers never depend on log delivery. The SDK's deprecation warning for `ctx.log` is filtered in `server.py`, with a comment explaining why.
 
 ## Timeouts and cancellation
 

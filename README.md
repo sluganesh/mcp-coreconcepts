@@ -1,6 +1,6 @@
 # MCP Learning Server
 
-A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server written in Python. It gives AI assistants such as Claude seven tools: two arithmetic tools, tools to read, create, update and delete employees in PostgreSQL, and a long-running job that demonstrates timeouts. Every call is logged, and every failure returns a clear error message instead of crashing the server.
+A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server written in Python. It gives AI assistants such as Claude eight tools (two arithmetic tools, tools to read, create, update, delete and bulk-import employees in PostgreSQL, and a long-running job that demonstrates timeouts), plus resources, prompts and autocomplete. Every call is logged, and every failure returns a clear error message instead of crashing the server.
 
 **Built with:** Python 3.12 · MCP Python SDK 2.x · PostgreSQL 16 · psycopg 3 · Docker Compose
 
@@ -14,6 +14,7 @@ A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server w
 - **Write tools with tool annotations:** create, update and delete tools run in database transactions and check their inputs (email format, salary above 0). Each tool is marked as read-only, destructive or idempotent, so clients can decide which calls need the user's approval.
 - **Resources and resource templates:** read-only data a client can load into the AI's context: an HR handbook, `employees://{employee_id}` profiles and `departments://{department}/employees` rosters.
 - **Prompts and autocomplete:** reusable HR templates (a department headcount report, a new-hire welcome email) that attach live data to the message, with autocomplete for department names and employee ids.
+- **Logging to the client:** `bulk_import_employees` sends debug, info and warning messages to the client as it imports a CSV, and also returns a complete summary. MCP logging is deprecated in the 2026-07-28 spec, so the summary is the part that keeps working.
 - **Elicitation (asking the user partway through a call):** `delete_employee` pauses to ask the user to confirm, and deletes only on an explicit "yes". It refuses to run on clients that can't show the prompt.
 - **Database access:** parameterized SQL queries, transactions that roll back on failure, and connection timeouts.
 - **Reproducible setup:** Docker Compose starts Postgres with a health check and loads sample data automatically.
@@ -45,6 +46,7 @@ flowchart LR
 | `create_employee` | `first_name`, `last_name`, `email`, `department`, `job_title`, `salary`, `hire_date` (optional, defaults to today) | The new employee record | Duplicate email; invalid email; salary not above 0; empty or too-long text |
 | `update_employee_salary` | `employee_id: int`, `new_salary: float` | The updated employee record | Unknown id; salary not above 0 |
 | `delete_employee` | `employee_id: int` | The deleted employee record, after the user confirms | Unknown id; the user declined, cancelled or didn't confirm; client can't show a confirmation prompt |
+| `bulk_import_employees` | `csv_text: str` (header row, then `first_name, last_name, email, department, job_title, salary`, and optionally `hire_date`) | `{imported, skipped, created_ids, problems}` | Missing columns; no rows; more than 1,000 rows. Bad or duplicate rows are skipped and listed in `problems`, not treated as errors |
 | `long_running_task` | `duration_seconds: float`, `timeout_seconds: float` (default 5) | A completion message, with a progress update every second | Task ran past its timeout; a value that isn't between 0 and 120 |
 
 ### Tool annotations
@@ -54,7 +56,7 @@ Each tool tells clients how it behaves. Clients can use these hints, for example
 | Tool | Read-only | Destructive | Idempotent | Why |
 |---|---|---|---|---|
 | `add_integer`, `divide`, `get_employees`, `long_running_task` | ✅ | — | ✅ | They don't change anything |
-| `create_employee` | ❌ | ❌ | ❌ | Adds a row without changing existing data; calling it twice adds two rows |
+| `create_employee`, `bulk_import_employees` | ❌ | ❌ | ❌ | Adds rows without changing existing data; calling it twice adds them twice |
 | `update_employee_salary` | ❌ | ✅ | ✅ | Overwrites the old salary; setting the same value twice gives the same result |
 | `delete_employee` | ❌ | ✅ | ✅ | Removes data; deleting the same id again changes nothing more |
 
@@ -68,6 +70,27 @@ Annotations let a client ask before running a tool, but nothing forces it to. Fo
 2. The client shows the prompt, and the user replies in one of three ways: **accept** (with the box checked or not), **decline** or **cancel**.
 3. Only **accept** with `confirm` checked deletes the record. Every other answer returns an error saying nothing was deleted.
 4. If the client doesn't support elicitation, the tool refuses rather than deleting without asking.
+
+### Bulk import and logging to the client
+
+`bulk_import_employees` imports a CSV the way an HR system would. It does its best with every row instead of all-or-nothing:
+
+1. **Check every row** with the same rules as `create_employee`. Invalid rows are skipped.
+2. **Insert the valid rows.** Each row gets its own database savepoint, so a duplicate email undoes only that row, not the whole import.
+3. **Report progress to the client** while it runs, using MCP log messages. The client chooses which levels it wants to see:
+   ```text
+   log [info]    Importing 4 rows.
+   log [warning] Skipped line 4: email: String should match pattern ...; salary: Input should be greater than 0
+   log [debug]   Imported line 2: Nisha Rao (id 32)
+   log [debug]   Imported line 3: Omar Khan (id 33)
+   log [warning] Skipped line 5: an employee with email aarav.sharma@example.com already exists
+   log [info]    Import finished: 2 imported, 2 skipped.
+   ```
+4. **Return a summary** with the counts, the new ids and one line per problem.
+
+**Log messages vs the server log:** `ctx.info()` and similar calls send messages **to the client**, which can show them to the user. They're separate from `mcp_calls.log`, which only the server's operator sees.
+
+> **Deprecated in the latest spec.** The MCP 2026-07-28 revision (SEP-2577) deprecates the logging capability. It still works with clients on earlier protocol versions, which is what this project's test client negotiates (2025-11-25). On newer connections, messages are only sent when the client opts in on each request. That's why the summary result repeats every problem: callers never depend on log messages arriving.
 
 ### Timeouts
 
@@ -149,7 +172,8 @@ python test_client.py
 Expected output:
 
 ```text
-Tools: ['add_integer', 'divide', 'get_employees', 'create_employee', 'update_employee_salary', 'delete_employee', 'long_running_task']
+Protocol version: 2025-11-25
+Tools: ['add_integer', 'divide', 'get_employees', 'create_employee', 'update_employee_salary', 'delete_employee', 'bulk_import_employees', 'long_running_task']
 add_integer(7, 35) = 42
 divide({'a': 10, 'b': 4}) -> OK: 2.5
 divide({'a': 10, 'b': 0}) -> ERROR: Error executing tool divide: Cannot divide by zero: 'b' must be a non-zero number.
@@ -194,6 +218,15 @@ get_prompt welcome_email({'employee_id': 'abc'}) -> MCPError -32602: 'abc' is no
 complete {'name': 'department', 'value': 'eng'} -> ['Engineering']
 complete {'name': 'employee_id', 'value': '1'} -> ['1', '10']
 complete {'name': 'department', 'value': 'm'} -> ['Marketing']
+bulk_import_employees (4 rows: 2 valid, 1 invalid, 1 duplicate):
+    log [info] Importing 4 rows.
+    log [warning] Skipped line 4: email: String should match pattern '^[^@\s]+@[^@\s]+\.[^@\s]+$'; salary: Input should be greater than 0
+    log [debug] Imported line 2: Nisha Rao (id 32)
+    log [debug] Imported line 3: Omar Khan (id 33)
+    log [warning] Skipped line 5: an employee with email aarav.sharma@example.com already exists
+    log [info] Import finished: 2 imported, 2 skipped.
+  -> imported 2, skipped 2, ids [32, 33]
+bulk_import_employees (wrong header) -> ERROR: Error executing tool bulk_import_employees: The CSV header is missing these columns: first_name, last_name, department, job_title, salary.
 long_running_task({'duration_seconds': 2, 'timeout_seconds': 5}):
     progress: 1/2 - 1s of 2s done
     progress: 2/2 - 2s of 2s done
