@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A learning project: a local MCP server in Python (`server.py`) that runs over the stdio transport and exposes a few tools (`add_integer`, `divide`, `get_employees`, `create_employee`, `update_employee_salary`, `delete_employee`, `long_running_task`). `get_employees` reads from a Postgres database that runs in Docker.
+A learning project: a local MCP server in Python (`server.py`) that runs over stdio (default) or streamable HTTP (`--http`) and exposes a few tools (`add_integer`, `divide`, `get_employees`, `create_employee`, `update_employee_salary`, `delete_employee`, `long_running_task`). `get_employees` reads from a Postgres database that runs in Docker.
 
 ## Commands
 
@@ -14,6 +14,8 @@ All Python commands use the project virtualenv at `.venv` (Windows paths).
 python -m venv .venv; .\.venv\Scripts\python.exe -m pip install -r requirements.txt   # setup
 docker compose up -d --wait                  # start Postgres (container mcp-learning-db, host port 5433)
 .\.venv\Scripts\python.exe test_client.py    # end-to-end test: spawns server.py over stdio, calls every tool
+.\.venv\Scripts\python.exe server.py --http   # streamable HTTP at http://127.0.0.1:8000/mcp (--port to change)
+.\.venv\Scripts\python.exe test_client.py --http http://127.0.0.1:8000/mcp   # same tests over HTTP
 npx @modelcontextprotocol/inspector .\.venv\Scripts\python.exe server.py   # browser UI for calling tools (http://127.0.0.1:6274)
 docker exec -it mcp-learning-db psql -U mcp_user -d company                # SQL prompt
 ```
@@ -27,6 +29,7 @@ There is no pytest suite, linter, or build step. `test_client.py` is the only te
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the full design, with diagrams. When you add or change a tool, keep it in sync with README.md.
 
 - **The SDK is `mcp` 2.x.** `FastMCP` was renamed `MCPServer` (`from mcp.server.mcpserver import MCPServer`), and `ToolError` lives in `mcp.server.mcpserver.exceptions`. Most online examples use the 1.x names and won't import.
+- **HTTP mode must stay on 127.0.0.1.** Binding to localhost is what makes the SDK turn on DNS-rebinding protection (a forged Host gets 421, a forged Origin gets 403), and the server has no authentication. Any new feature must work over both transports; test with `test_client.py` both with and without `--http`.
 - **Never write to stdout from the server.** The stdio transport uses stdout for protocol messages. Logging goes to `mcp_calls.log` and to stderr.
 - **Defining a tool:** stack `@mcp.tool()` on the outside and `@log_call` on the inside. `log_call` uses `functools.wraps`, which keeps the original signature visible, and the SDK builds the tool's input schema and argument validation from that signature and its type hints. Each tool's docstring becomes its description.
 - **Tool annotations:** every tool passes `annotations=` to `@mcp.tool()`. Read-only tools use the shared `READ_ONLY` preset. Write tools set `destructive_hint` (true when existing data is overwritten or removed) and `idempotent_hint` explicitly, with a comment explaining the choice. Keep the annotations table in README.md in sync.

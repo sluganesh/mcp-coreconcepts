@@ -1,15 +1,29 @@
-"""Start server.py over stdio and exercise every tool, including failure cases."""
+"""Exercise every tool, resource and prompt, including failure cases.
 
+    python test_client.py                               # starts server.py over stdio
+    python test_client.py --http http://127.0.0.1:8000/mcp   # connects to a running HTTP server
+"""
+
+import argparse
 import asyncio
 import sys
 import uuid
 
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 
 
 SERVER = StdioServerParameters(command=sys.executable, args=["server.py"])
+http_url: str | None = None  # set by --http
+
+
+def connect():
+    """Open a transport to the server. Both return the same (read, write) pair."""
+    if http_url:
+        return streamable_http_client(http_url)
+    return stdio_client(SERVER)
 
 # Scripted answers for confirmation prompts, used in order. A real client
 # would show the prompt to the user instead.
@@ -24,7 +38,8 @@ async def answer_elicitation(context, params):
 
 
 async def main():
-    async with stdio_client(SERVER) as (read, write):
+    print("Transport:", f"streamable HTTP ({http_url})" if http_url else "stdio")
+    async with connect() as (read, write):
         # Passing an elicitation_callback makes the client declare that it
         # supports elicitation, so the server may ask the user questions.
         async with ClientSession(
@@ -123,7 +138,7 @@ async def test_delete_confirmation(session, employee_id):
         show("delete_employee", args, await session.call_tool("delete_employee", args))
 
     # A client without elicitation support is refused, and nothing is deleted.
-    async with stdio_client(SERVER) as (read, write):
+    async with connect() as (read, write):
         async with ClientSession(read, write) as no_prompt_session:
             await no_prompt_session.initialize()
             print("  (client without elicitation support)")
@@ -246,4 +261,7 @@ async def test_long_running_task(session):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--http", metavar="URL", help="Connect to a server already running with --http.")
+    http_url = parser.parse_args().http
     asyncio.run(main())

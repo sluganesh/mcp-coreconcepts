@@ -15,6 +15,7 @@ A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server w
 - **Resources and resource templates:** read-only data a client can load into the AI's context: an HR handbook, `employees://{employee_id}` profiles and `departments://{department}/employees` rosters.
 - **Prompts and autocomplete:** reusable HR templates (a department headcount report, a new-hire welcome email) that attach live data to the message, with autocomplete for department names and employee ids.
 - **Pagination:** `get_employees` returns results a page at a time with an opaque cursor, the MCP convention, using keyset pagination in SQL.
+- **Two transports:** stdio, where each client starts its own copy of the server, or streamable HTTP, where one running server is shared by many clients. HTTP mode is bound to localhost with DNS-rebinding protection.
 - **Logging to the client:** `bulk_import_employees` sends debug, info and warning messages to the client as it imports a CSV, and also returns a complete summary. MCP logging is deprecated in the 2026-07-28 spec, so the summary is the part that keeps working.
 - **Elicitation (asking the user partway through a call):** `delete_employee` pauses to ask the user to confirm, and deletes only on an explicit "yes". It refuses to run on clients that can't show the prompt.
 - **Database access:** parameterized SQL queries, transactions that roll back on failure, and connection timeouts.
@@ -32,7 +33,7 @@ flowchart LR
     Log[("mcp_calls.log")]
     DB[("PostgreSQL 16<br/>Docker, port 5433")]
 
-    Client <-- "JSON-RPC over stdio" --> Server
+    Client <-- "JSON-RPC over stdio or streamable HTTP" --> Server
     Server -- "every call" --> Log
     Server -- "employee tools" --> DB
 ```
@@ -259,6 +260,42 @@ long_running_task({'duration_seconds': 10, 'timeout_seconds': 30}) with a 2s cli
 ```
 
 (The output above is shortened. The full run also prints the tool annotations and the validation errors for `divide(10, "abc")`, an invalid email and a negative salary. The test creates its own employee with a random email and deletes it at the end, so it can be run repeatedly.)
+
+## Running over HTTP
+
+By default the server uses **stdio**: every client starts its own copy of `server.py` and talks to it through stdin/stdout. With `--http`, the server runs once as a web service, and any number of clients connect to its URL. This is how MCP servers are usually deployed for a team.
+
+```bash
+python server.py --http                  # serves http://127.0.0.1:8000/mcp
+python server.py --http --port 9000      # choose another port
+
+# In a second terminal, run the whole test suite over HTTP:
+python test_client.py --http http://127.0.0.1:8000/mcp
+```
+
+| | stdio | Streamable HTTP |
+|---|---|---|
+| Who starts the server | Each client starts its own copy | You start it once; clients connect to a URL |
+| Clients per server | One | Many, each with its own session |
+| Messages from the server during a request (confirmation prompts, progress, log messages) | Over stdout | Streamed back as server-sent events on the same HTTP request |
+| Good for | Local tools on one machine | Shared or remote servers |
+
+Everything works the same over both transports, including delete confirmations, progress updates, log messages and client-side cancellation. Two test clients running at the same time against one HTTP server both pass.
+
+**Security.** In HTTP mode the server listens only on `127.0.0.1`. On localhost the SDK turns on **DNS-rebinding protection**, which stops a malicious website from using your browser to reach the server:
+
+| Request | Response |
+|---|---|
+| Forged `Host: evil.example.com` | `421 Misdirected Request` |
+| Forged `Origin: http://evil.example.com` (a web page on another site) | `403 Forbidden` |
+
+**Opening the URL in a browser** shows `{"error": {"code": -32600, "message": "Bad Request: Missing session ID"}}`. That's expected: `/mcp` is an API endpoint for MCP clients, which first `POST` an `initialize` message and then send the returned `Mcp-Session-Id` header with every request.
+
+The server has **no authentication**, so it must not listen on other network interfaces. Serving it beyond localhost would need an authorization layer (MCP specifies OAuth 2.1 for HTTP servers).
+
+**Connecting other clients over HTTP:**
+- **MCP Inspector:** start it with no server arguments (`npx @modelcontextprotocol/inspector`). If it's started with a server command, the session is read-only and you can't add servers. Then add a server with transport *Streamable HTTP* and URL `http://127.0.0.1:8000/mcp`.
+- **Claude Code:** `claude mcp add --transport http learning-server-http http://127.0.0.1:8000/mcp`
 
 ## Other ways to try it
 

@@ -5,24 +5,27 @@ This document explains how the MCP Learning Server is put together: its componen
 ## Contents
 
 1. [Overview](#overview)
-2. [Components](#components)
-3. [Life of a tool call](#life-of-a-tool-call)
-4. [Error handling](#error-handling)
-5. [Tool annotations](#tool-annotations)
-6. [Elicitation: confirming deletes](#elicitation-confirming-deletes)
-7. [Resources](#resources)
-8. [Prompts and completions](#prompts-and-completions)
-9. [Pagination](#pagination)
-10. [Bulk import and logging to the client](#bulk-import-and-logging-to-the-client)
-11. [Timeouts and cancellation](#timeouts-and-cancellation)
-12. [Logging](#logging)
-13. [Data layer](#data-layer)
-14. [Design decisions](#design-decisions)
-15. [Known limitations](#known-limitations)
+2. [Transports](#transports)
+3. [Components](#components)
+4. [Life of a tool call](#life-of-a-tool-call)
+5. [Error handling](#error-handling)
+6. [Tool annotations](#tool-annotations)
+7. [Elicitation: confirming deletes](#elicitation-confirming-deletes)
+8. [Resources](#resources)
+9. [Prompts and completions](#prompts-and-completions)
+10. [Pagination](#pagination)
+11. [Bulk import and logging to the client](#bulk-import-and-logging-to-the-client)
+12. [Timeouts and cancellation](#timeouts-and-cancellation)
+13. [Logging](#logging)
+14. [Data layer](#data-layer)
+15. [Design decisions](#design-decisions)
+16. [Known limitations](#known-limitations)
 
 ## Overview
 
-The system is a single Python process that speaks the [Model Context Protocol](https://modelcontextprotocol.io), plus a PostgreSQL database running in Docker. An MCP client, such as Claude, the MCP Inspector or `test_client.py`, starts the server as a child process and sends it JSON-RPC messages over stdin/stdout.
+The system is a single Python process that speaks the [Model Context Protocol](https://modelcontextprotocol.io), plus a PostgreSQL database running in Docker. MCP clients, such as Claude, the MCP Inspector or `test_client.py`, send it JSON-RPC messages over one of two transports (see [Transports](#transports)):
+- **stdio (default):** the client starts the server as a child process and talks over stdin/stdout.
+- **Streamable HTTP (`--http`):** the server runs as a service at `http://127.0.0.1:8000/mcp`, and many clients connect to it.
 
 ```mermaid
 flowchart LR
@@ -53,23 +56,54 @@ flowchart LR
 
     LOG[("mcp_calls.log<br/>+ stderr")]
 
-    C <-- "JSON-RPC over stdio" --> SDK
+    C <-- "JSON-RPC over stdio or streamable HTTP" --> SDK
     LC -- "every call" --> LOG
     H -- "psycopg 3 / SQL" --> DB
 ```
+
+## Transports
+
+The same server code runs over either transport. `python server.py` uses stdio, and `python server.py --http [--port N]` uses streamable HTTP.
+
+```mermaid
+flowchart LR
+    subgraph stdio["stdio (default)"]
+        C1["Client A"] -- "starts" --> S1["server.py (copy 1)"]
+        C2["Client B"] -- "starts" --> S2["server.py (copy 2)"]
+    end
+    subgraph http["Streamable HTTP (--http)"]
+        C3["Client A"] --> S3["server.py<br/>127.0.0.1:8000/mcp"]
+        C4["Client B"] --> S3
+        C5["Client C"] --> S3
+    end
+```
+
+**How streamable HTTP works:**
+- The client sends each JSON-RPC message as an HTTP `POST` to `/mcp`.
+- The server replies with either a plain JSON response or a **server-sent events (SSE)** stream. The stream lets the server send extra messages before the final result, such as elicitation requests, progress notifications and log messages. That's why the delete confirmation and the bulk-import log messages work unchanged over HTTP.
+- The first request creates a session, and the server returns a session id in the `Mcp-Session-Id` header. The client sends it with every later request, so each client keeps its own state. Two test clients running at the same time against one server both pass.
+
+**Security:**
+- **Localhost only.** `--http` binds to `127.0.0.1`, so the server can't be reached from other machines.
+- **DNS-rebinding protection.** Because the server is on localhost, the SDK checks the `Host` and `Origin` headers against localhost values. This stops a malicious web page from using the user's browser to call the server. Tested behavior: a forged `Host` gets `421 Misdirected Request`, and a forged `Origin` gets `403 Forbidden`.
+- **No authentication.** Binding to localhost is what keeps this safe. See [Known limitations](#known-limitations).
+
+**Transport-specific code:**
+- **The server** only chooses the transport in its `__main__` block. Tools, resources and prompts are unaware of which one is in use.
+- **The test client** chooses between `stdio_client` and `streamable_http_client` in one `connect()` helper, since both return the same `(read, write)` stream pair.
 
 ## Components
 
 | Component | File | Responsibility |
 |---|---|---|
-| MCP server | `server.py` | Registers the tools, runs the stdio transport, and holds all tool logic |
+| MCP server | `server.py` | Registers the tools, resources and prompts, runs the stdio or streamable HTTP transport, and holds all the logic |
 | `log_call` decorator | `server.py` | Logs each call's arguments, result, duration and outcome, for both sync and async tools |
 | Tools | `server.py` | `add_integer`, `divide`, `get_employees`, `create_employee`, `update_employee_salary`, `delete_employee`, `bulk_import_employees` and `long_running_task` |
 | Resources | `server.py`, `resources/hr_handbook.md` | `hr://handbook`, `employees://{employee_id}` and `departments://{department}/employees` |
 | Prompts and completions | `server.py` | `department_headcount_report` and `welcome_email`, plus autocomplete for `department` and `employee_id` |
 | `employees_db()` | `server.py` | Opens a database transaction for the employee tools and turns database errors into `ToolError`s |
 | Database | `docker-compose.yml`, `db/init.sql` | PostgreSQL 16 with an `employees` table and 10 sample rows |
-| Test client | `test_client.py` | Starts the server over stdio and calls every tool, covering success, failure and timeout cases |
+| Test client | `test_client.py` | Starts the server over stdio, or connects to a running HTTP server with `--http URL`, and calls every tool, resource and prompt, covering success, failure and timeout cases |
 
 The MCP Python SDK (version 2.x, class `MCPServer`) does most of the protocol work:
 - It turns each tool's type hints and docstring into a JSON schema and a description.
@@ -400,7 +434,8 @@ sequenceDiagram
 
 | Decision | Reason |
 |---|---|
-| stdio transport | This is the standard way to run a local MCP server. The client manages the server process, and no network port or authentication is needed. |
+| stdio by default, streamable HTTP as an option | stdio is the standard for a local server: the client manages the process, and no port or authentication is needed. HTTP lets one server be shared by many clients. The same code serves both. |
+| HTTP bound to localhost only | The SDK turns on DNS-rebinding protection for localhost, and without authentication the server must not be reachable from other machines |
 | Type hints as the contract | One source of truth: the SDK builds both the schema the AI sees and the input validation from the function signature. |
 | Server-side confirmation (elicitation) for deletes, refusing if the client can't prompt | Annotations are only hints. For an action that can't be undone, the server enforces the "ask first" rule itself and fails safe. |
 | Resources for read-only reference data, next to the read tools | The client or user can attach data (a policy document, a profile) to the conversation directly, without the AI having to decide to call a tool |
@@ -418,5 +453,6 @@ These are deliberate simplifications for a learning project, with what a product
 - **Database queries can't be interrupted.** `get_employees` runs on a worker thread, so a client cancellation doesn't stop a query that's already running. An async tool with `psycopg.AsyncConnection` and a Postgres `statement_timeout` would make queries cancellable and time-limited.
 - **No automated test suite.** `test_client.py` is an end-to-end script that prints results rather than asserting them. The next step would be pytest tests that check `is_error` and returned values.
 - **Only deletes are confirmed.** `update_employee_salary` is also destructive, but it relies on the client respecting its annotations. The same elicitation pattern could confirm large salary changes, for example.
-- **No authentication.** That's appropriate for stdio, where only the parent process can talk to the server. The streamable HTTP transport would need an auth layer.
+- **No authentication.** That's appropriate for stdio, where only the parent process can talk to the server, and for HTTP bound to localhost. Exposing the HTTP server to a network would need an authorization layer: the MCP spec defines OAuth 2.1 for HTTP servers.
+- **HTTP sessions live in memory.** Sessions are held by one server process, and a session that is idle for 30 minutes (the SDK default) is closed. Running several server instances behind a load balancer would need sticky sessions, or the SDK's stateless mode.
 - **Development credentials in `docker-compose.yml`.** Fine for a local sample database. A real deployment would load them from secrets.

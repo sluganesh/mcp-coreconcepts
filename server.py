@@ -3,10 +3,14 @@ read-only resources (HR handbook, employee profiles, department rosters),
 HR prompts with argument completion, and a long-running task that
 demonstrates timeouts.
 
+Runs over stdio by default (the client starts the server), or with --http as a
+streamable HTTP service at http://127.0.0.1:8000/mcp that many clients share.
+
 Every tool call is logged to mcp_calls.log (and stderr). Nothing is logged to
 stdout, because the stdio transport uses stdout for MCP protocol messages.
 """
 
+import argparse
 import asyncio
 import base64
 import csv
@@ -749,5 +753,21 @@ async def long_running_task(
 
 
 if __name__ == "__main__":
-    logger.info("Starting learning-server (stdio transport)")
-    mcp.run()
+    parser = argparse.ArgumentParser(description="Run the learning MCP server.")
+    parser.add_argument(
+        "--http",
+        action="store_true",
+        help="Serve over streamable HTTP at http://127.0.0.1:<port>/mcp instead of stdio.",
+    )
+    parser.add_argument("--port", type=int, default=8000, help="Port for --http (default 8000).")
+    cli = parser.parse_args()
+
+    if cli.http:
+        # Bound to localhost on purpose: the SDK then turns on DNS-rebinding
+        # protection (it checks the Host and Origin headers). This server has
+        # no authentication, so it must not listen on other interfaces.
+        logger.info("Starting learning-server (streamable HTTP) at http://127.0.0.1:%d/mcp", cli.port)
+        mcp.run("streamable-http", host="127.0.0.1", port=cli.port)
+    else:
+        logger.info("Starting learning-server (stdio transport)")
+        mcp.run()
