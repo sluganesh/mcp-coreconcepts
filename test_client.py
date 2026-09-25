@@ -8,8 +8,10 @@ import argparse
 import asyncio
 import sys
 import uuid
+from contextlib import AsyncExitStack
 
-from mcp import ClientSession, StdioServerParameters, types
+import anyio
+from mcp import Client, ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
@@ -71,6 +73,8 @@ async def main():
             await test_prompts(session)
             await test_bulk_import(session)
             await test_long_running_task(session)
+
+    await test_change_notifications()
 
 
 def show(name, args, result):
@@ -233,6 +237,38 @@ Dup,Email,aarav.sharma@example.com,Engineering,Engineer,80000,
     for employee_id in summary["created_ids"]:
         elicitation_answers.append(types.ElicitResult(action="accept", content={"confirm": True}))
         await session.call_tool("delete_employee", {"employee_id": employee_id})
+
+
+async def test_change_notifications():
+    # Subscriptions need the 2026-07-28 protocol. The high-level Client negotiates
+    # it; the ClientSession used above does the older handshake (2025-11-25).
+    async with AsyncExitStack() as stack:
+        client = await stack.enter_async_context(Client(http_url or SERVER))
+        # Over HTTP, a second client makes the changes: a shared server notifies
+        # every subscriber. Over stdio each client has its own server, so the
+        # same client both watches and edits.
+        editor = await stack.enter_async_context(Client(http_url)) if http_url else client
+        who = "another client" if http_url else "the same client"
+        print(f"Change notifications (protocol {client.protocol_version}, changes made by {who}):")
+        watched = ["employees://3", "departments://Engineering/employees"]
+        subscription = await stack.enter_async_context(client.listen(resource_subscriptions=watched))
+        print(f"  subscribed to {subscription.honored.resource_subscriptions}")
+
+        # Change Rahul's salary, then put it back, so the sample data is unchanged.
+        for salary in (150000, 145000):
+            await editor.call_tool("update_employee_salary", {"employee_id": 3, "new_salary": salary})
+            with anyio.fail_after(5):
+                for _ in watched:
+                    event = await anext(subscription)
+                    print(f"  salary -> {salary}: {type(event).__name__} {event.uri}")
+
+        # A change to someone in another department doesn't notify these subscriptions.
+        await editor.call_tool("update_employee_salary", {"employee_id": 4, "new_salary": 72000})
+        with anyio.move_on_after(1) as waited:
+            event = await anext(subscription)
+            print(f"  unexpected event: {event}")
+        if waited.cancelled_caught:
+            print("  employee 4 (Marketing) changed -> no event for these subscriptions, as expected")
 
 
 async def show_progress(progress, total, message):

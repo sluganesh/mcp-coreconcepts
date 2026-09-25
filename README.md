@@ -16,6 +16,7 @@ A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server w
 - **Prompts and autocomplete:** reusable HR templates (a department headcount report, a new-hire welcome email) that attach live data to the message, with autocomplete for department names and employee ids.
 - **Pagination:** `get_employees` returns results a page at a time with an opaque cursor, the MCP convention, using keyset pagination in SQL.
 - **Two transports:** stdio, where each client starts its own copy of the server, or streamable HTTP, where one running server is shared by many clients. HTTP mode is bound to localhost with DNS-rebinding protection.
+- **Change notifications:** clients subscribe to resources such as `employees://3`, and the server tells them when a tool changes that data. Over HTTP this works across clients: one client watches while another makes the change.
 - **Logging to the client:** `bulk_import_employees` sends debug, info and warning messages to the client as it imports a CSV, and also returns a complete summary. MCP logging is deprecated in the 2026-07-28 spec, so the summary is the part that keeps working.
 - **Elicitation (asking the user partway through a call):** `delete_employee` pauses to ask the user to confirm, and deletes only on an explicit "yes". It refuses to run on clients that can't show the prompt.
 - **Database access:** parameterized SQL queries, transactions that roll back on failure, and connection timeouts.
@@ -145,6 +146,28 @@ This project exposes employee data both ways on purpose, to show the contrast. A
 Resource errors reach the client as protocol errors (`MCPError`), not as tool-style `is_error` results:
 - Code `-32602` for anything that doesn't exist: an unknown employee id, an id that isn't a number, an unknown department (the message lists the real departments), or a URI that matches nothing.
 - Code `-32603` for other failures, such as the database being down.
+
+### Change notifications
+
+A client can **subscribe** to resources and be told when they change, instead of re-reading them over and over. Think of an HR dashboard showing Rahul's profile that updates by itself when his salary changes.
+
+Whenever a tool changes an employee (`create_employee`, `update_employee_salary`, `delete_employee`, `bulk_import_employees`), the server publishes a `ResourceUpdated` event for:
+- `employees://{id}`, the employee's profile
+- `departments://{department}/employees`, their department's roster
+
+```text
+subscribed to ['employees://3', 'departments://Engineering/employees']
+salary -> 150000: ResourceUpdated employees://3
+salary -> 150000: ResourceUpdated departments://Engineering/employees
+employee 4 (Marketing) changed -> no event for these subscriptions, as expected
+```
+
+- **Only after the change is saved.** Events are sent once the database transaction has committed, so a client that re-reads the resource straight away sees the new data.
+- **Only what you subscribed to.** A change to someone in Marketing doesn't notify a client watching Engineering.
+- **Across clients over HTTP.** On the shared HTTP server, one client subscribes and another makes the change, and the watcher is notified. Over stdio, each client has its own server, so it only sees its own changes.
+- **Try it live.** Run `python server.py --http` and then `python -u examples/watch_employee.py` in a second terminal. Change employee 3's salary from the MCP Inspector, and the watcher prints the change and the new profile.
+- **Exact URIs.** Subscriptions match the URI exactly, so subscribe to `departments://Engineering/employees` with the department's real capitalization, even though reading the resource isn't case-sensitive.
+- **Protocol version.** Subscriptions use the 2026-07-28 spec's `subscriptions/listen` stream. The SDK's `Client` class negotiates that version automatically. Clients on older versions can't subscribe to this server, because the SDK's `MCPServer` doesn't implement the older `resources/subscribe` request.
 
 ## Prompts
 
@@ -350,7 +373,8 @@ The database uses port **5433** so it doesn't clash with a Postgres server that 
 
 ```text
 server.py            MCP server: tools, logging decorator, database access
-test_client.py       End-to-end test that talks to the server over stdio
+test_client.py       End-to-end test over stdio or HTTP (--http URL)
+examples/            Demo clients (watch_employee.py: live change notifications)
 db/init.sql          Employees table and sample data
 resources/           Static resource content (HR handbook)
 docs/ARCHITECTURE.md Design, request flow, error handling, timeouts

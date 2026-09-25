@@ -28,6 +28,7 @@ from datetime import date
 from pathlib import Path
 from typing import Annotated
 
+import anyio.from_thread
 import psycopg
 from psycopg.rows import class_row, dict_row
 from pydantic import BaseModel, Field, ValidationError
@@ -222,6 +223,28 @@ Salary = Annotated[float, Field(gt=0, lt=100_000_000, description="Annual salary
 Name = Annotated[str, Field(min_length=1, max_length=50)]
 
 
+# --- Change notifications ---------------------------------------------------
+# When an employee changes, tell clients subscribed to the affected resources:
+# the employee's profile and their department's roster. Called only after the
+# database transaction has committed, so a subscriber that re-reads the
+# resource sees the new data.
+#
+# These reach clients on the 2026-07-28 protocol, which subscribe with
+# subscriptions/listen. MCPServer doesn't implement the older
+# resources/subscribe, so clients on earlier protocols can't subscribe.
+
+
+async def notify_employee_changed(ctx: Context, employee: Employee) -> None:
+    for uri in (f"employees://{employee.id}", f"departments://{employee.department}/employees"):
+        await ctx.notify_resource_updated(uri)
+    logger.info("NOTIFY resources updated for employee %s (%s)", employee.id, employee.department)
+
+
+def notify_from_thread(ctx: Context, employee: Employee) -> None:
+    """notify_employee_changed for sync tools, which the SDK runs on a worker thread."""
+    anyio.from_thread.run(notify_employee_changed, ctx, employee)
+
+
 @mcp.tool(annotations=READ_ONLY)
 @log_call
 def get_employees(
@@ -285,6 +308,7 @@ def decode_cursor(cursor: str) -> int:
 )
 @log_call
 def create_employee(
+    ctx: Context,
     first_name: Name,
     last_name: Name,
     email: Annotated[
@@ -299,7 +323,7 @@ def create_employee(
     """Add a new employee and return the created record."""
     try:
         with employees_db() as conn:
-            return conn.execute(
+            employee = conn.execute(
                 f"""
                 INSERT INTO employees (first_name, last_name, email, department, job_title, salary, hire_date)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -312,6 +336,8 @@ def create_employee(
         if isinstance(exc.__cause__, psycopg.errors.UniqueViolation):
             raise ToolError(f"An employee with email {email} already exists.") from None
         raise
+    notify_from_thread(ctx, employee)
+    return employee
 
 
 # Overwrites the old salary, so it's destructive. Idempotent: setting the same
@@ -326,7 +352,7 @@ def create_employee(
     )
 )
 @log_call
-def update_employee_salary(employee_id: EmployeeId, new_salary: Salary) -> Employee:
+def update_employee_salary(ctx: Context, employee_id: EmployeeId, new_salary: Salary) -> Employee:
     """Change an employee's annual salary and return the updated record."""
     with employees_db() as conn:
         employee = conn.execute(
@@ -335,6 +361,7 @@ def update_employee_salary(employee_id: EmployeeId, new_salary: Salary) -> Emplo
         ).fetchone()
     if employee is None:
         raise ToolError(f"No employee found with id {employee_id}.")
+    notify_from_thread(ctx, employee)
     return employee
 
 
@@ -415,7 +442,9 @@ async def delete_employee(ctx: Context, employee_id: EmployeeId) -> Employee:
     if not answer.data.confirm:
         raise ToolError(f"Deletion was not confirmed. Employee {employee_id} was not deleted.")
 
-    return await asyncio.to_thread(remove_employee, employee_id)
+    employee = await asyncio.to_thread(remove_employee, employee_id)
+    await notify_employee_changed(ctx, employee)
+    return employee
 
 
 # --- Bulk import (logging to the client) ------------------------------------
@@ -534,6 +563,7 @@ async def bulk_import_employees(
             await ctx.warning(f"Skipped line {line}: {outcome}")
         else:
             created_ids.append(outcome.id)
+            await notify_employee_changed(ctx, outcome)
             await ctx.debug(f"Imported line {line}: {outcome.first_name} {outcome.last_name} (id {outcome.id})")
 
     await ctx.info(f"Import finished: {len(created_ids)} imported, {len(problems)} skipped.")

@@ -12,14 +12,15 @@ This document explains how the MCP Learning Server is put together: its componen
 6. [Tool annotations](#tool-annotations)
 7. [Elicitation: confirming deletes](#elicitation-confirming-deletes)
 8. [Resources](#resources)
-9. [Prompts and completions](#prompts-and-completions)
-10. [Pagination](#pagination)
-11. [Bulk import and logging to the client](#bulk-import-and-logging-to-the-client)
-12. [Timeouts and cancellation](#timeouts-and-cancellation)
-13. [Logging](#logging)
-14. [Data layer](#data-layer)
-15. [Design decisions](#design-decisions)
-16. [Known limitations](#known-limitations)
+9. [Change notifications](#change-notifications)
+10. [Prompts and completions](#prompts-and-completions)
+11. [Pagination](#pagination)
+12. [Bulk import and logging to the client](#bulk-import-and-logging-to-the-client)
+13. [Timeouts and cancellation](#timeouts-and-cancellation)
+14. [Logging](#logging)
+15. [Data layer](#data-layer)
+16. [Design decisions](#design-decisions)
+17. [Known limitations](#known-limitations)
 
 ## Overview
 
@@ -274,6 +275,33 @@ sequenceDiagram
 
 A production server decides per piece of data. It uses a tool when the model should decide, a resource when the user should choose, and both only when both uses are real. The HR handbook is exposed only as a resource, because it's reference content, not something to act on.
 
+## Change notifications
+
+Clients can subscribe to resources and receive a `ResourceUpdated` event when the data behind them changes.
+
+```mermaid
+sequenceDiagram
+    participant W as Client A (dashboard)
+    participant S as Server (shared, HTTP)
+    participant E as Client B (HR admin)
+    participant DB as PostgreSQL
+
+    W->>S: subscriptions/listen {resourceSubscriptions: [employees://3, departments://Engineering/employees]}
+    S-->>W: ack (honored filter)
+    E->>S: tools/call update_employee_salary {employee_id: 3, new_salary: 150000}
+    S->>DB: UPDATE … RETURNING (commit)
+    S-->>E: updated Employee
+    S-->>W: ResourceUpdated employees://3
+    S-->>W: ResourceUpdated departments://Engineering/employees
+    W->>S: resources/read employees://3 (fetch the new version)
+```
+
+- **What publishes.** Every tool that changes an employee (`create_employee`, `update_employee_salary`, `delete_employee`, `bulk_import_employees`) calls `notify_employee_changed()` after its transaction commits. It publishes events for the employee's profile URI and their department roster URI, using the department's stored capitalization, because subscriptions match URIs exactly.
+- **Sync and async tools.** Async tools await the helper directly. Sync tools run on a worker thread, so `notify_from_thread()` hands the call back to the event loop with `anyio.from_thread.run`. That avoided rewriting the sync tools as async.
+- **Fan-out.** `MCPServer` publishes to an in-memory `SubscriptionBus`, which delivers each event to every matching `subscriptions/listen` stream in the same process. On the shared HTTP server, that includes other clients' subscriptions. Tested: client A is notified when client B changes the salary. With several server processes, you would pass a `SubscriptionBus` backed by an external pub/sub system, such as Redis or Postgres `LISTEN/NOTIFY`.
+- **Notifications carry no data.** An event only says "this URI changed", and the client decides whether to re-read it. This keeps events small, and sensitive data (salaries) only flows through normal, access-controlled reads.
+- **Protocol versions.** `subscriptions/listen` is the 2026-07-28 mechanism. The SDK's `Client` negotiates that version by probing `server/discover`. The older `resources/subscribe` request isn't implemented by `MCPServer`, so clients using the older handshake (such as `ClientSession`, which negotiates 2025-11-25) see `subscribe: false` in the server's capabilities. The same applies to list-changed events (`tools_list_changed` and so on): the server supports them, but its tools, resources and prompts are fixed at startup, so it never needs to send them.
+
 ## Prompts and completions
 
 Prompts are reusable templates that the **user** invokes. Clients typically show them as a menu or as slash commands. The client collects the arguments, calls `prompts/get`, and sends the returned messages to the AI.
@@ -454,5 +482,6 @@ These are deliberate simplifications for a learning project, with what a product
 - **No automated test suite.** `test_client.py` is an end-to-end script that prints results rather than asserting them. The next step would be pytest tests that check `is_error` and returned values.
 - **Only deletes are confirmed.** `update_employee_salary` is also destructive, but it relies on the client respecting its annotations. The same elicitation pattern could confirm large salary changes, for example.
 - **No authentication.** That's appropriate for stdio, where only the parent process can talk to the server, and for HTTP bound to localhost. Exposing the HTTP server to a network would need an authorization layer: the MCP spec defines OAuth 2.1 for HTTP servers.
+- **Older clients can't subscribe.** Change notifications only reach clients on the 2026-07-28 protocol. Supporting the older `resources/subscribe` request would need the SDK's low-level server API.
 - **HTTP sessions live in memory.** Sessions are held by one server process, and a session that is idle for 30 minutes (the SDK default) is closed. Running several server instances behind a load balancer would need sticky sessions, or the SDK's stateless mode.
 - **Development credentials in `docker-compose.yml`.** Fine for a local sample database. A real deployment would load them from secrets.
