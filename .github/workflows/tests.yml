@@ -1,0 +1,40 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: company
+          POSTGRES_USER: mcp_user
+          POSTGRES_PASSWORD: mcp_password
+        ports:
+          - 5433:5432   # same port as docker-compose.yml, so no config changes
+        options: >-
+          --health-cmd "pg_isready -U mcp_user -d company"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # The tests create their own company_test database from db/init.sql.
+      - name: Run tests
+        run: pytest

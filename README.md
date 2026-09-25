@@ -1,5 +1,7 @@
 # MCP Learning Server
 
+[![tests](https://github.com/sluganesh/mcp-coreconcepts/actions/workflows/tests.yml/badge.svg)](https://github.com/sluganesh/mcp-coreconcepts/actions/workflows/tests.yml)
+
 A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server written in Python. It gives AI assistants such as Claude eight tools (two arithmetic tools, tools to read, create, update, delete and bulk-import employees in PostgreSQL, and a long-running job that demonstrates timeouts), plus resources, prompts and autocomplete. Every call is logged, and every failure returns a clear error message instead of crashing the server.
 
 **Built with:** Python 3.12 · MCP Python SDK 2.x · PostgreSQL 16 · psycopg 3 · Docker Compose
@@ -18,10 +20,10 @@ A local [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server w
 - **Two transports:** stdio, where each client starts its own copy of the server, or streamable HTTP, where one running server is shared by many clients. HTTP mode is bound to localhost with DNS-rebinding protection.
 - **Change notifications:** clients subscribe to resources such as `employees://3`, and the server tells them when a tool changes that data. Over HTTP this works across clients: one client watches while another makes the change.
 - **Logging to the client:** `bulk_import_employees` sends debug, info and warning messages to the client as it imports a CSV, and also returns a complete summary. MCP logging is deprecated in the 2026-07-28 spec, so the summary is the part that keeps working.
-- **Elicitation (asking the user partway through a call):** `delete_employee` pauses to ask the user to confirm, and deletes only on an explicit "yes". It refuses to run on clients that can't show the prompt.
+- **Elicitation (asking the user partway through a call):** `delete_employee` asks the user to confirm and deletes only on an explicit "yes". It uses the SDK's resolver mechanism, so it works with both the 2025-11-25 protocol (question sent mid-call) and the 2026-07-28 protocol (the client retries with the answer). It refuses to run on clients that can't show the prompt.
 - **Database access:** parameterized SQL queries, transactions that roll back on failure, and connection timeouts.
 - **Reproducible setup:** Docker Compose starts Postgres with a health check and loads sample data automatically.
-- **End-to-end testing:** a test client starts the server as a real MCP client would and calls every tool, covering both success and failure cases.
+- **Automated testing and CI:** 111 pytest cases run every test on **both** MCP protocol versions against an isolated test database, including a real HTTP server process. GitHub Actions runs them on every push.
 
 ## How it works
 
@@ -199,16 +201,39 @@ git clone https://github.com/sluganesh/mcp-coreconcepts.git
 cd mcp-coreconcepts
 python -m venv .venv
 .venv\Scripts\activate          # macOS/Linux: source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # the server's dependencies plus pytest
 
 # 2. Start PostgreSQL (the sample employee data loads on first start)
 docker compose up -d --wait
 
-# 3. Run the end-to-end test
+# 3. Run the automated tests
+pytest
+
+# 4. See every feature in action (printed walkthrough)
 python test_client.py
 ```
 
-Expected output:
+### Automated tests
+
+```text
+$ pytest
+111 passed, 2 skipped in 18.10s
+```
+
+- **Both protocol versions.** Every test runs twice, on MCP **2026-07-28** and on **2025-11-25**, because some features work differently between them. Running both is how a real bug was caught: the first version of the delete confirmation crashed on the newer protocol. The 2 skipped cases are protocol-specific checks that only apply to one version.
+- **An isolated database.** Tests use their own `company_test` database, rebuilt from `db/init.sql` before each test, so they never change your data.
+- **Fast.** Most tests connect to the server in-process, with no subprocess or port. `tests/test_http.py` also starts `server.py --http` as a real process, to test HTTP and the DNS-rebinding protection.
+- **Useful commands:**
+  ```bash
+  pytest tests/test_tools.py              # one file
+  pytest -k pagination                    # tests whose names match
+  pytest "tests/test_tools.py::test_divide[2026-07-28]"   # one test, one protocol
+  ```
+- **Continuous integration.** GitHub Actions runs the suite on every push, with a Postgres service container (see `.github/workflows/tests.yml`).
+
+### Walkthrough output
+
+`python test_client.py` calls every feature and prints the results:
 
 ```text
 Protocol version: 2025-11-25
@@ -373,7 +398,8 @@ The database uses port **5433** so it doesn't clash with a Postgres server that 
 
 ```text
 server.py            MCP server: tools, logging decorator, database access
-test_client.py       End-to-end test over stdio or HTTP (--http URL)
+tests/               Automated pytest suite (both protocol versions, isolated test DB)
+test_client.py       Printed walkthrough of every feature, over stdio or HTTP (--http URL)
 examples/            Demo clients (watch_employee.py: live change notifications)
 db/init.sql          Employees table and sample data
 resources/           Static resource content (HR handbook)

@@ -32,7 +32,7 @@ import anyio.from_thread
 import psycopg
 from psycopg.rows import class_row, dict_row
 from pydantic import BaseModel, Field, ValidationError
-from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver import Context, Elicit, ElicitationResult, MCPServer, Resolve
 from mcp.server.mcpserver.exceptions import ResourceError, ResourceNotFoundError, ToolError
 from mcp.server.mcpserver.prompts.base import Message, UserMessage
 from mcp.shared.exceptions import MCPDeprecationWarning, MCPError
@@ -393,6 +393,31 @@ def remove_employee(employee_id: int) -> Employee:
     return employee
 
 
+async def ask_to_confirm_delete(ctx: Context, employee_id: int) -> Elicit[DeleteConfirmation]:
+    """Resolver: build the confirmation question for delete_employee.
+
+    The SDK asks it in the way the connection's protocol expects:
+    - 2025-11-25 and earlier: a server-to-client elicitation/create request, mid-call.
+    - 2026-07-28 and later: the call returns an InputRequiredResult; the client
+      asks the user and calls the tool again with the answer. This resolver may
+      run on each round, so it must not change anything.
+    """
+    # Refuse rather than delete without asking: this client can't show a prompt.
+    capabilities = ctx.client_capabilities
+    if capabilities is None or capabilities.elicitation is None:
+        raise ToolError(
+            "delete_employee needs a client that supports confirmation prompts "
+            "(MCP elicitation). Nothing was deleted."
+        )
+    # Database calls are blocking, so run them on a worker thread.
+    employee = await asyncio.to_thread(find_employee, employee_id)
+    return Elicit(
+        f"Permanently delete {employee.first_name} {employee.last_name} "
+        f"(id {employee.id}, {employee.job_title}, {employee.department})? This cannot be undone.",
+        DeleteConfirmation,
+    )
+
+
 # Removes data, so it's destructive. Idempotent: deleting the same id again
 # leaves the database in the same state (the second call reports "not found").
 @mcp.tool(
@@ -405,31 +430,17 @@ def remove_employee(employee_id: int) -> Employee:
     )
 )
 @log_call
-async def delete_employee(ctx: Context, employee_id: EmployeeId) -> Employee:
+async def delete_employee(
+    ctx: Context,
+    employee_id: EmployeeId,
+    # Filled in by the SDK from the user's answer, not by the caller, so it isn't
+    # part of the input schema.
+    answer: Annotated[ElicitationResult[DeleteConfirmation], Resolve(ask_to_confirm_delete)],
+) -> Employee:
     """Permanently delete an employee and return the record that was removed.
 
     The user is asked to confirm before anything is deleted.
     """
-    # Refuse rather than delete without asking: this client can't show a prompt.
-    capabilities = ctx.client_capabilities
-    if capabilities is None or capabilities.elicitation is None:
-        raise ToolError(
-            "delete_employee needs a client that supports confirmation prompts "
-            "(MCP elicitation). Nothing was deleted."
-        )
-
-    # Database calls are blocking, so run them on a worker thread to keep the
-    # event loop free while this async tool waits.
-    employee = await asyncio.to_thread(find_employee, employee_id)
-
-    answer = await ctx.elicit(
-        message=(
-            f"Permanently delete {employee.first_name} {employee.last_name} "
-            f"(id {employee.id}, {employee.job_title}, {employee.department})? "
-            "This cannot be undone."
-        ),
-        schema=DeleteConfirmation,
-    )
     logger.info(
         "ELICIT delete_employee id=%s -> %s %s",
         employee_id, answer.action, getattr(answer, "data", None) or "",

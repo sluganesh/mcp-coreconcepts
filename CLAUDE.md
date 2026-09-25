@@ -13,7 +13,11 @@ All Python commands use the project virtualenv at `.venv` (Windows paths).
 ```powershell
 python -m venv .venv; .\.venv\Scripts\python.exe -m pip install -r requirements.txt   # setup
 docker compose up -d --wait                  # start Postgres (container mcp-learning-db, host port 5433)
-.\.venv\Scripts\python.exe test_client.py    # end-to-end test: spawns server.py over stdio, calls every tool
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt   # adds pytest
+.\.venv\Scripts\python.exe -m pytest                                 # full automated suite (~20 s)
+.\.venv\Scripts\python.exe -m pytest tests/test_tools.py -k pagination    # one file / matching tests
+.\.venv\Scripts\python.exe -m pytest "tests/test_tools.py::test_divide[2026-07-28]"   # one test, one protocol
+.\.venv\Scripts\python.exe test_client.py    # printed walkthrough: spawns server.py over stdio, calls every tool
 .\.venv\Scripts\python.exe server.py --http   # streamable HTTP at http://127.0.0.1:8000/mcp (--port to change)
 .\.venv\Scripts\python.exe test_client.py --http http://127.0.0.1:8000/mcp   # same tests over HTTP
 npx @modelcontextprotocol/inspector .\.venv\Scripts\python.exe server.py   # browser UI for calling tools (http://127.0.0.1:6274)
@@ -22,18 +26,25 @@ docker exec -it mcp-learning-db psql -U mcp_user -d company                # SQL
 
 The server is registered with Claude Code for this project (local scope) as `learning-server`. Its prompts only run as `/mcp__learning-server__<prompt>` in a Claude Code session started after the registration; the terminal CLI supports this.
 
-There is no pytest suite, linter, or build step. `test_client.py` is the only test: it's a plain script that prints each call's result or error. To exercise a single tool, edit the calls in that script or use the Inspector.
+There is no linter or build step. GitHub Actions (`.github/workflows/tests.yml`) runs `pytest` on every push, with a Postgres service on port 5433.
+
+**Tests (`tests/`):**
+- **Test database:** `conftest.py` creates a separate `company_test` database on the same Postgres server, points `server.DATABASE_URL` at it, and rebuilds the `employees` table from `db/init.sql` before **every** test. Tests can therefore rely on the 10 seed rows and ids 1–10, and never touch the real `company` data.
+- **In-process client:** the `harness` fixture connects `mcp.Client` to `server.mcp` in-process (no subprocess or port), and runs each test **twice**: on protocol 2026-07-28 (`mode="auto"`) and on 2025-11-25 (`mode="legacy"`). Features differ between them, so new features need tests on both. Queue scripted confirmation answers in `harness.answers`; captured client log messages are in `harness.logs`.
+- **Checking the database:** use `db_query()` to see what a tool actually changed.
+- **HTTP:** `tests/test_http.py` starts `server.py --http` as a subprocess against the test database.
+- **`test_client.py`** is kept as a printed, end-to-end walkthrough, not the test suite.
 
 ## Architecture and gotchas
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the full design, with diagrams. When you add or change a tool, keep it in sync with README.md.
 
 - **The SDK is `mcp` 2.x.** `FastMCP` was renamed `MCPServer` (`from mcp.server.mcpserver import MCPServer`), and `ToolError` lives in `mcp.server.mcpserver.exceptions`. Most online examples use the 1.x names and won't import.
-- **HTTP mode must stay on 127.0.0.1.** Binding to localhost is what makes the SDK turn on DNS-rebinding protection (a forged Host gets 421, a forged Origin gets 403), and the server has no authentication. Any new feature must work over both transports; test with `test_client.py` both with and without `--http`.
+- **HTTP mode must stay on 127.0.0.1.** Binding to localhost is what makes the SDK turn on DNS-rebinding protection (a forged Host gets 421, a forged Origin gets 403), and the server has no authentication. Any new feature must work over both transports; `test_client.py` runs with or without `--http`.
 - **Never write to stdout from the server.** The stdio transport uses stdout for protocol messages. Logging goes to `mcp_calls.log` and to stderr.
 - **Defining a tool:** stack `@mcp.tool()` on the outside and `@log_call` on the inside. `log_call` uses `functools.wraps`, which keeps the original signature visible, and the SDK builds the tool's input schema and argument validation from that signature and its type hints. Each tool's docstring becomes its description.
 - **Tool annotations:** every tool passes `annotations=` to `@mcp.tool()`. Read-only tools use the shared `READ_ONLY` preset. Write tools set `destructive_hint` (true when existing data is overwritten or removed) and `idempotent_hint` explicitly, with a comment explaining the choice. Keep the annotations table in README.md in sync.
-- **Elicitation:** `delete_employee` is async so it can `await ctx.elicit(...)`. It checks `ctx.client_capabilities.elicitation` first and refuses if the client can't show prompts. It deletes only on `accept` with `confirm=True`. Its blocking database work runs through `asyncio.to_thread`, so the event loop stays free. In `test_client.py`, confirmation answers are scripted: queue an `ElicitResult` in `elicitation_answers` before each call.
+- **Elicitation: use a resolver, never `ctx.elicit()` directly.** On the 2026-07-28 protocol, a server can't send requests mid-call, so `ctx.elicit()` raises `NoBackChannelError`. Instead, `delete_employee` takes `answer: Annotated[ElicitationResult[DeleteConfirmation], Resolve(ask_to_confirm_delete)]`. The resolver returns `Elicit(message, schema)`, and the SDK asks the question the right way for each protocol: a mid-call `elicitation/create` on 2025-11-25, or an `InputRequiredResult` plus a client retry on 2026-07-28. Resolvers may run on every retry round, so they must not change anything. `ask_to_confirm_delete` also refuses clients without elicitation support, and looks up the employee so unknown ids fail before any question is asked.
 - **Resources:** registered with `@mcp.resource(uri, ...)` stacked on `@log_call`. A URI with `{placeholders}` becomes a template, and its values arrive as strings, so validate them in the handler (see `employee_profile`) rather than typing them as `int`. Resource failures raise `ResourceNotFoundError` or `ResourceError`, which clients receive as `MCPError` codes -32602 and -32603. Wrap database access in `resource_errors()` so `employees_db()`'s `ToolError`s become `ResourceError`s. Static content lives in `resources/`.
 - **Prompts:** registered with `@mcp.prompt(title=..., description=...)` stacked on `@log_call`. They return a list of `UserMessage`s, and live data is attached with `embedded_resource()`. Prompt arguments are always strings. Only `MCPError` reaches the client with its message intact; the SDK turns any other exception into "Error rendering prompt X". Wrap calls to resource helpers in `prompt_errors()`, which converts `ResourceNotFoundError` and `ResourceError` into `MCPError` codes -32602 and -32603.
 - **Completions:** a single `@mcp.completion()` handler, `complete_argument`, serves both prompt arguments and resource template placeholders. It matches on the argument's name (`department`, `employee_id`), so reusing those names elsewhere gets autocomplete for free.
@@ -52,7 +63,7 @@ There is no pytest suite, linter, or build step. `test_client.py` is the only te
   - The connection string comes from the `DATABASE_URL` environment variable. The default matches `docker-compose.yml`: `postgresql://mcp_user:mcp_password@localhost:5433/company`. Port 5433 is deliberate, because other local projects' Postgres containers already use 5432 and 55432.
   - All database access goes through the `employees_db()` context manager. It opens a transaction (committed on success, rolled back on any exception) and turns `psycopg` errors into `ToolError`s. To give a specific message for one database error, catch the `ToolError` and check `exc.__cause__` (see the duplicate-email handling in `create_employee`).
   - The server uses `psycopg` 3 with `class_row(Employee)`, so each row is built as a Pydantic model and validated. `EMPLOYEE_COLUMNS` is taken from `Employee.model_fields` and used in `SELECT` and `RETURNING`, so a new column needs a new model field.
-  - `test_client.py` creates an employee with a random email and deletes it at the end, so the table stays at the 10 seeded rows.
+  - `test_client.py` runs against the real `company` database. It creates an employee with a random email and deletes it at the end, so the table stays at the 10 seeded rows.
   - Pydantic converts `NUMERIC` to `float` and `DATE` to an ISO string. Tools return models (`EmployeeList`), which gives clients a detailed output schema. Model docstrings and field descriptions appear in that schema, so write them for the client; put developer notes in comments.
   - Use `%s` placeholders for all query parameters.
 - **Schema and seed data:** `db/init.sql` runs only when the `pgdata` volume is first created. After editing it, run `docker compose down -v` and then `docker compose up -d` to re-seed.

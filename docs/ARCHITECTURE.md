@@ -19,8 +19,9 @@ This document explains how the MCP Learning Server is put together: its componen
 13. [Timeouts and cancellation](#timeouts-and-cancellation)
 14. [Logging](#logging)
 15. [Data layer](#data-layer)
-16. [Design decisions](#design-decisions)
-17. [Known limitations](#known-limitations)
+16. [Testing](#testing)
+17. [Design decisions](#design-decisions)
+18. [Known limitations](#known-limitations)
 
 ## Overview
 
@@ -104,7 +105,8 @@ flowchart LR
 | Prompts and completions | `server.py` | `department_headcount_report` and `welcome_email`, plus autocomplete for `department` and `employee_id` |
 | `employees_db()` | `server.py` | Opens a database transaction for the employee tools and turns database errors into `ToolError`s |
 | Database | `docker-compose.yml`, `db/init.sql` | PostgreSQL 16 with an `employees` table and 10 sample rows |
-| Test client | `test_client.py` | Starts the server over stdio, or connects to a running HTTP server with `--http URL`, and calls every tool, resource and prompt, covering success, failure and timeout cases |
+| Automated tests | `tests/`, `pytest.ini`, `.github/workflows/tests.yml` | A pytest suite that runs every test on both protocol versions against an isolated test database, and runs in GitHub Actions on every push |
+| Walkthrough client | `test_client.py` | Starts the server over stdio, or connects to a running HTTP server with `--http URL`, and prints the result of calling every tool, resource and prompt |
 
 The MCP Python SDK (version 2.x, class `MCPServer`) does most of the protocol work:
 - It turns each tool's type hints and docstring into a JSON schema and a description.
@@ -221,10 +223,27 @@ sequenceDiagram
     end
 ```
 
-- **Capability check.** A client declares elicitation support when it connects. In the Python SDK, it does so by passing an `elicitation_callback`. The tool checks `ctx.client_capabilities.elicitation` first, and refuses instead of deleting without asking. For a destructive action, that's the safe default.
+The diagram shows the 2025-11-25 flow, where the server sends `elicitation/create` in the middle of the call. The 2026-07-28 spec doesn't allow that: a server can't send requests while handling one. Instead, the call returns an `InputRequiredResult` containing the question, and the client asks the user and calls the tool again with the answer. The tool supports both through the SDK's **resolver** mechanism:
+
+```python
+async def ask_to_confirm_delete(ctx, employee_id) -> Elicit[DeleteConfirmation]:
+    ...  # check the client can ask, look up the employee
+    return Elicit("Permanently delete Rahul Verma (id 3, …)? This cannot be undone.", DeleteConfirmation)
+
+async def delete_employee(
+    ctx, employee_id,
+    answer: Annotated[ElicitationResult[DeleteConfirmation], Resolve(ask_to_confirm_delete)],
+): ...
+```
+
+The SDK runs the resolver, asks the question the right way for the negotiated protocol, and passes the user's answer in as `answer`. `answer` isn't part of the tool's input schema, so callers only ever send `employee_id`.
+
+- **Why a resolver.** The first version called `ctx.elicit()` directly. That worked for 2025-11-25 clients, but on 2026-07-28 connections it failed with `NoBackChannelError`. The automated tests run every test on both protocols, which is how this was found and how it stays fixed.
+- **Resolvers can run more than once.** On 2026-07-28, the resolver may run on each retry, so it only reads data and never changes anything. The delete itself happens in the tool body, after the answer has arrived.
+- **Capability check.** A client declares elicitation support when it connects. In the Python SDK, it does so by passing an `elicitation_callback`. The resolver checks `ctx.client_capabilities.elicitation` and refuses instead of deleting without asking. For a destructive action, that's the safe default.
 - **Three responses.** `accept` means the user submitted the form. `decline` means they explicitly said no. `cancel` means they dismissed the prompt. The form also has a `confirm` checkbox, so an `accept` with the box unchecked doesn't delete anything either.
-- **Looking up the record first.** The prompt shows the employee's name and role, so the user can confirm the right record. Unknown ids fail before any prompt is shown. If the record disappears while the user is deciding, the `DELETE … RETURNING` finds nothing and the tool reports "not found".
-- **Async tool, blocking database.** `delete_employee` is async so that it can `await ctx.elicit(...)`. Its database calls are blocking, so it runs them through `asyncio.to_thread` to keep the event loop free for other requests while it waits for the user.
+- **Looking up the record first.** The prompt shows the employee's name and role, so the user can confirm the right record. Unknown ids fail in the resolver, before any prompt is shown. If the record disappears while the user is deciding, the `DELETE … RETURNING` finds nothing and the tool reports "not found".
+- **Blocking database calls.** The resolver and the tool are async, so their database calls run through `asyncio.to_thread` to keep the event loop free for other requests while the user decides.
 - **Audit log.** Every answer is logged, for example `ELICIT delete_employee id=17 -> accept confirm=True`.
 
 ## Resources
@@ -458,6 +477,41 @@ sequenceDiagram
 - **Id gaps are expected.** A failed insert, such as one with a duplicate email, still uses up the next value of the `id` sequence, because Postgres sequences are never rolled back. Ids are therefore unique but not guaranteed to be consecutive.
 - **Port.** The database uses host port 5433 so that it can run alongside another Postgres server on the default port, 5432.
 
+## Testing
+
+`pytest` runs 111 test cases in about 20 seconds, locally and in GitHub Actions.
+
+```mermaid
+flowchart LR
+    subgraph pytest
+        T["tests/*.py"]
+        H["harness fixture<br/>mcp.Client(server.mcp)"]
+        P["server.py --http<br/>(subprocess, test_http.py)"]
+    end
+    subgraph Postgres
+        TDB[("company_test<br/>rebuilt before every test")]
+        DB[("company<br/>never touched")]
+    end
+    T --> H
+    T --> P
+    H -- "in-process, protocol 2026-07-28 and 2025-11-25" --> S["server.mcp"]
+    S --> TDB
+    P --> TDB
+```
+
+- **Isolated data.** `conftest.py` creates a `company_test` database on the same Postgres server and points `server.DATABASE_URL` at it. Before every test, the `employees` table is dropped and rebuilt from `db/init.sql`. Tests can rely on exactly 10 employees with ids 1–10, can change or delete data freely, and never affect the real `company` database. The test database is dropped at the end of the run.
+- **In-process client.** The SDK's `Client` connects directly to the `server.mcp` object: no subprocess, no port, no JSON over pipes. Most tests take a few milliseconds.
+- **Both protocol versions.** The `harness` fixture is parametrized, so every test runs once on 2026-07-28 and once on 2025-11-25. That catches differences between the specs, such as the delete confirmation bug described in [Elicitation](#elicitation-confirming-deletes). Two protocol-specific checks (subscriptions, and the older protocol's lack of them) are skipped on the other version.
+- **User answers and log messages.** The harness scripts elicitation answers (`harness.answers`), records the prompts shown to the user (`harness.prompts_shown`), and captures client log messages (`harness.logs`), so those can be asserted on.
+- **Checking real effects.** Tests check the database directly with `db_query()`, not only the tool's response. For example, after a declined delete, the employee must still exist.
+- **Over HTTP.** `test_http.py` starts `server.py --http` on a free port as a real process, pointed at the test database. It checks that a client can use it, and that forged `Host` and `Origin` headers are rejected with 421 and 403.
+- **What's covered:**
+  - Every tool, including validation errors, pagination (including stability when rows are deleted between pages), write tools, annotations, bulk import with savepoints, and log messages.
+  - The delete confirmation, with all five outcomes.
+  - Resources and their error codes, prompts, and completions.
+  - Progress updates, server- and client-side timeouts, change notifications, and HTTP security.
+- **Continuous integration.** `.github/workflows/tests.yml` starts a `postgres:16-alpine` service on port 5433 (the same as `docker-compose.yml`) and runs `pytest` on every push and pull request.
+
 ## Design decisions
 
 | Decision | Reason |
@@ -479,7 +533,6 @@ These are deliberate simplifications for a learning project, with what a product
 
 - **A new database connection per call.** A connection pool (`psycopg_pool`) would avoid the setup cost of each call.
 - **Database queries can't be interrupted.** `get_employees` runs on a worker thread, so a client cancellation doesn't stop a query that's already running. An async tool with `psycopg.AsyncConnection` and a Postgres `statement_timeout` would make queries cancellable and time-limited.
-- **No automated test suite.** `test_client.py` is an end-to-end script that prints results rather than asserting them. The next step would be pytest tests that check `is_error` and returned values.
 - **Only deletes are confirmed.** `update_employee_salary` is also destructive, but it relies on the client respecting its annotations. The same elicitation pattern could confirm large salary changes, for example.
 - **No authentication.** That's appropriate for stdio, where only the parent process can talk to the server, and for HTTP bound to localhost. Exposing the HTTP server to a network would need an authorization layer: the MCP spec defines OAuth 2.1 for HTTP servers.
 - **Older clients can't subscribe.** Change notifications only reach clients on the 2026-07-28 protocol. Supporting the older `resources/subscribe` request would need the SDK's low-level server API.

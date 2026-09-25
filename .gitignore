@@ -2,4 +2,5 @@
 __pycache__/
 *.pyc
 mcp_calls.log
+.pytest_cache/
 .env
